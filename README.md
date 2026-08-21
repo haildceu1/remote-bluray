@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.1.3-py3-none-any.whl
+python -m pip install remote_bluray-0.2.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -78,6 +78,20 @@ $env:REMOTE_BLURAY_FFPROBE = "C:\tools\ffmpeg\bin\ffprobe.exe"
 $isoUrl = (Get-Content -LiteralPath "D:\Cinema\strm\...\movie.strm" -Raw).Trim()
 python -X utf8 remote_bluray.py list $isoUrl
 ```
+
+## 远程读取速度与并发
+
+远程 ISO 默认使用受控并发 Range 读取：`workers=2`、`prefetch=2`、`range-size=8M`。这会在保持请求量相对温和的同时，提前读取后续数据块。
+
+可以根据远程服务器的限速情况调整：
+
+```powershell
+python -X utf8 remote_bluray.py --workers 2 --prefetch 2 --range-size 8M list "D:\Cinema\strm\...\movie.strm"
+
+python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls -o "D:\output\movie.mkv" --workers 4 --prefetch 4 --range-size 16M
+```
+
+建议先使用 `2/2/8M`；确认服务端没有返回 `429`、`403` 或频繁断开后，再尝试 `4/4/16M`。程序对 `429` 和 `5xx` 响应使用指数退避；并发过高仍可能触发远程服务的限速。
 
 ## 查看播放列表
 

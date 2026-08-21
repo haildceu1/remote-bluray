@@ -8,6 +8,8 @@ BDMV/STREAM/*.m2ts URL without downloading the whole ISO first.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import shutil
@@ -15,6 +17,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -26,9 +29,12 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 BLOCK_SIZE = 2048
-RANGE_CACHE_SIZE = 4 * 1024 * 1024
+DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
+DEFAULT_WORKERS = 2
+DEFAULT_PREFETCH = 2
+MAX_RETRIES = 4
 
 
 def u16(data: bytes, offset: int) -> int:
@@ -295,64 +301,204 @@ def source_to_url(source: str | Path) -> str:
 
 
 class RemoteRangeReader:
-    def __init__(self, url: str, verbose: bool = False):
-        self.session = requests.Session()
+    def __init__(
+        self,
+        url: str,
+        verbose: bool = False,
+        workers: int = DEFAULT_WORKERS,
+        prefetch: int = DEFAULT_PREFETCH,
+        range_size: int = DEFAULT_RANGE_SIZE,
+    ):
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        if prefetch < 0:
+            raise ValueError("prefetch must be non-negative")
+        if range_size < BLOCK_SIZE or range_size % BLOCK_SIZE:
+            raise ValueError(f"range_size must be a multiple of {BLOCK_SIZE} bytes")
+
         self.verbose = verbose
-        self.position = 0
-        self.cache_start = -1
-        self.cache_data = b""
+        self.workers = workers
+        self.prefetch = prefetch
+        self.range_size = range_size
         self.lock = threading.RLock()
-        response = self.session.get(
+        self._thread_local = threading.local()
+        self._cache: OrderedDict[int, bytes] = OrderedDict()
+        self._inflight = {}
+        self._executor = None
+
+        session = requests.Session()
+        response = session.get(
             url,
             headers={"Range": "bytes=0-0"},
             allow_redirects=True,
             timeout=30,
         )
-        response.raise_for_status()
-        if response.status_code != 206:
-            raise RuntimeError(f"Remote server does not support Range: HTTP {response.status_code}")
-        content_range = response.headers.get("Content-Range", "")
-        if "/" not in content_range:
-            raise RuntimeError("Remote response has no Content-Range header")
-        self.size = int(content_range.rsplit("/", 1)[1])
-        self.final_url = response.url
+        try:
+            response.raise_for_status()
+            if response.status_code != 206:
+                raise RuntimeError(f"Remote server does not support Range: HTTP {response.status_code}")
+            content_range = response.headers.get("Content-Range", "")
+            if "/" not in content_range:
+                raise RuntimeError("Remote response has no Content-Range header")
+            self.size = int(content_range.rsplit("/", 1)[1])
+            self.final_url = response.url
+        finally:
+            response.close()
+        self._base_cookies = session.cookies.copy()
+        session.close()
+
+        # Keep the default memory footprint bounded even when range-size is
+        # increased.  The current chunk plus the prefetch window remain
+        # available whenever the configured size fits within this cap.
+        cache_memory_cap = 256 * 1024 * 1024
+        memory_limit = max(1, cache_memory_cap // self.range_size)
+        self.cache_limit = max(1, min(workers + prefetch + 2, memory_limit))
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.workers,
+            thread_name_prefix="remote-bluray-range",
+        )
         if verbose:
             print(f"ISO size: {self.size:,} bytes")
             print(f"Final URL: {self.final_url[:120]}...")
+            print(
+                f"Range reader: workers={self.workers}, "
+                f"prefetch={self.prefetch}, range-size={self.range_size:,} bytes"
+            )
+
+    def _session_for_thread(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.cookies.update(self._base_cookies)
+            self._thread_local.session = session
+        return session
+
+    @staticmethod
+    def _retry_delay(response, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            return min(30.0, max(0.0, float(retry_after)))
+        except ValueError:
+            return min(8.0, 0.5 * (2**attempt))
 
     def _fetch(self, start: int, end: int) -> bytes:
-        response = self.session.get(
-            self.final_url,
-            headers={"Range": f"bytes={start}-{end}"},
-            timeout=60,
-        )
-        response.raise_for_status()
-        if response.status_code != 206:
-            raise IOError(f"Range request failed: HTTP {response.status_code}")
-        data = response.content
-        if self.verbose:
-            print(f"Remote Range: {start}-{end} -> {len(data):,} bytes")
-        return data
+        expected = end - start + 1
+        session = self._session_for_thread()
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            response = None
+            try:
+                response = session.get(
+                    self.final_url,
+                    headers={"Range": f"bytes={start}-{end}"},
+                    timeout=60,
+                )
+                if response.status_code == 206:
+                    data = response.content
+                    if len(data) != expected:
+                        raise IOError(
+                            f"Range returned {len(data):,} bytes; expected {expected:,}"
+                        )
+                    if self.verbose:
+                        print(f"Remote Range: {start}-{end} -> {len(data):,} bytes")
+                    return data
+
+                retryable = response.status_code == 429 or response.status_code >= 500
+                if not retryable:
+                    raise RuntimeError(f"Range request failed: HTTP {response.status_code}")
+                last_error = IOError(f"Range request failed: HTTP {response.status_code}")
+                if attempt >= MAX_RETRIES:
+                    raise last_error
+                delay = self._retry_delay(response, attempt)
+                if self.verbose:
+                    print(
+                        f"Range {start}-{end} got HTTP {response.status_code}; "
+                        f"retrying in {delay:.1f}s"
+                    )
+                time.sleep(delay)
+            except (requests.RequestException, IOError) as error:
+                last_error = error
+                if attempt >= MAX_RETRIES:
+                    raise IOError(f"Range request failed for {start}-{end}: {error}") from error
+                delay = min(8.0, 0.5 * (2**attempt))
+                if self.verbose:
+                    print(f"Range {start}-{end} failed; retrying in {delay:.1f}s: {error}")
+                time.sleep(delay)
+            finally:
+                if response is not None:
+                    response.close()
+        raise IOError(f"Range request failed for {start}-{end}: {last_error}")
+
+    def _fetch_chunk(self, index: int) -> bytes:
+        start = index * self.range_size
+        if start >= self.size:
+            return b""
+        end = min(start + self.range_size, self.size) - 1
+        return self._fetch(start, end)
+
+    def _complete_chunk(self, index: int, future) -> None:
+        try:
+            data = future.result()
+        except Exception:
+            with self.lock:
+                if self._inflight.get(index) is future:
+                    self._inflight.pop(index, None)
+            return
+        with self.lock:
+            if self._inflight.get(index) is future:
+                self._inflight.pop(index, None)
+            if data:
+                self._cache[index] = data
+                self._cache.move_to_end(index)
+                while len(self._cache) > self.cache_limit:
+                    self._cache.popitem(last=False)
+
+    def _ensure_chunk(self, index: int) -> None:
+        if index * self.range_size >= self.size:
+            return
+        with self.lock:
+            if index in self._cache or index in self._inflight:
+                return
+            future = self._executor.submit(self._fetch_chunk, index)
+            self._inflight[index] = future
+            future.add_done_callback(lambda completed: self._complete_chunk(index, completed))
+
+    def _get_chunk(self, index: int) -> bytes:
+        with self.lock:
+            data = self._cache.get(index)
+            if data is not None:
+                self._cache.move_to_end(index)
+                return data
+            future = self._inflight.get(index)
+            if future is None:
+                future = self._executor.submit(self._fetch_chunk, index)
+                self._inflight[index] = future
+                future.add_done_callback(lambda completed: self._complete_chunk(index, completed))
+        return future.result()
+
+    def _schedule_prefetch(self, index: int) -> None:
+        for next_index in range(index + 1, index + 1 + self.prefetch):
+            self._ensure_chunk(next_index)
 
     def read_range(self, start: int, size: int) -> bytes:
         if size <= 0 or start >= self.size:
             return b""
         start = max(0, start)
-        size = min(size, self.size - start)
+        end = min(start + size, self.size)
         output = bytearray()
-        with self.lock:
-            while size:
-                cache_end = self.cache_start + len(self.cache_data)
-                if not self.cache_start <= start < cache_end:
-                    fetch_end = min(start + RANGE_CACHE_SIZE - 1, self.size - 1)
-                    self.cache_start = start
-                    self.cache_data = self._fetch(start, fetch_end)
-                    cache_end = self.cache_start + len(self.cache_data)
-                offset = start - self.cache_start
-                count = min(size, len(self.cache_data) - offset)
-                output.extend(self.cache_data[offset : offset + count])
-                start += count
-                size -= count
+        while start < end:
+            index = start // self.range_size
+            data = self._get_chunk(index)
+            if not data:
+                break
+            chunk_start = index * self.range_size
+            offset = start - chunk_start
+            count = min(end - start, len(data) - offset)
+            if count <= 0:
+                raise IOError(f"Invalid cached Range chunk at index {index}")
+            output.extend(data[offset : offset + count])
+            start += count
+            self._schedule_prefetch(index)
         return bytes(output)
 
     def read_block(self, lba: int) -> bytes:
@@ -406,7 +552,10 @@ class UdfFile:
         output = bytearray()
         offset = 0
         while offset < self.size:
-            chunk = self.read_at(offset, min(RANGE_CACHE_SIZE, self.size - offset))
+            chunk = self.read_at(
+                offset,
+                min(self.image.remote.range_size, self.size - offset),
+            )
             if not chunk:
                 break
             output.extend(chunk)
@@ -415,11 +564,24 @@ class UdfFile:
 
 
 class RemoteUdfImage:
-    def __init__(self, source: str | Path, verbose: bool = False):
+    def __init__(
+        self,
+        source: str | Path,
+        verbose: bool = False,
+        workers: int = DEFAULT_WORKERS,
+        prefetch: int = DEFAULT_PREFETCH,
+        range_size: int = DEFAULT_RANGE_SIZE,
+    ):
         self.source = str(source)
         self.url = source_to_url(source)
         self.verbose = verbose
-        self.remote = RemoteRangeReader(self.url, verbose=verbose)
+        self.remote = RemoteRangeReader(
+            self.url,
+            verbose=verbose,
+            workers=workers,
+            prefetch=prefetch,
+            range_size=range_size,
+        )
         self.partition_starts: dict[int, int] = {}
         self.partition_lengths: dict[int, int] = {}
         self.metadata_partition = None
@@ -967,8 +1129,18 @@ def input_audio_codecs(input_args: list[str]) -> set[str]:
     }
 
 
+def image_from_args(args) -> RemoteUdfImage:
+    return RemoteUdfImage(
+        args.source,
+        verbose=args.verbose,
+        workers=args.workers,
+        prefetch=args.prefetch,
+        range_size=args.range_size,
+    )
+
+
 def command_list(args):
-    image = RemoteUdfImage(args.source, verbose=args.verbose)
+    image = image_from_args(args)
     playlists = image.playlist_candidates()
     print(f"Playlist Count:          {len(playlists)}")
     print("（不计入 .mpls.backup）\n")
@@ -978,7 +1150,7 @@ def command_list(args):
 
 
 def command_probe(args):
-    image = RemoteUdfImage(args.source, verbose=args.verbose)
+    image = image_from_args(args)
     with VirtualFileServer(image, verbose=args.verbose) as server:
         with virtual_input(image, server, args.stream, args.playlist) as selected:
             input_args, label = selected
@@ -1000,7 +1172,7 @@ def command_probe(args):
 
 
 def command_extract_audio(args):
-    image = RemoteUdfImage(args.source, verbose=args.verbose)
+    image = image_from_args(args)
     if args.playlist or args.mode:
         playlists = select_playlists(image, args.playlist, args.mode, args.min_duration)
         if not playlists:
@@ -1052,7 +1224,7 @@ def command_extract_audio(args):
 
 
 def command_extract_video(args):
-    image = RemoteUdfImage(args.source, verbose=args.verbose)
+    image = image_from_args(args)
     if args.playlist or args.mode:
         playlists = select_playlists(image, args.playlist, args.mode, args.min_duration)
         if not playlists:
@@ -1098,17 +1270,96 @@ def command_extract_video(args):
                 print(f"Output: {output}")
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def parse_range_size(value: str) -> int:
+    text = str(value).strip().lower()
+    units = {
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gib": 1024**3,
+    }
+    multiplier = 1
+    number = text
+    for suffix in sorted(units, key=len, reverse=True):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)].strip()
+            multiplier = units[suffix]
+            break
+    try:
+        parsed = int(float(number) * multiplier)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("use a byte count such as 8388608 or 8M") from error
+    if parsed < BLOCK_SIZE or parsed % BLOCK_SIZE:
+        raise argparse.ArgumentTypeError(
+            f"must be at least {BLOCK_SIZE} bytes and a multiple of {BLOCK_SIZE}"
+        )
+    return parsed
+
+
+def add_remote_options(parser, suppress_defaults: bool = False) -> None:
+    default_workers = argparse.SUPPRESS if suppress_defaults else DEFAULT_WORKERS
+    default_prefetch = argparse.SUPPRESS if suppress_defaults else DEFAULT_PREFETCH
+    default_range_size = argparse.SUPPRESS if suppress_defaults else DEFAULT_RANGE_SIZE
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=default_workers,
+        help=f"parallel Range downloads (default: {DEFAULT_WORKERS})",
+    )
+    parser.add_argument(
+        "--prefetch",
+        type=nonnegative_int,
+        default=default_prefetch,
+        help=f"number of future Range chunks to prefetch (default: {DEFAULT_PREFETCH})",
+    )
+    parser.add_argument(
+        "--range-size",
+        type=parse_range_size,
+        default=default_range_size,
+        metavar="SIZE",
+        help="HTTP Range chunk size, e.g. 4M, 8M, or 8388608",
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=f"remote-bluray {__version__}")
     parser.add_argument("--verbose", action="store_true", help="show local HTTP and remote Range activity")
+    add_remote_options(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list", help="list Blu-ray streams and playlists")
+    add_remote_options(list_parser, suppress_defaults=True)
     list_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
     list_parser.set_defaults(func=command_list)
 
     probe_parser = subparsers.add_parser("probe", help="probe a virtual M2TS or MPLS timeline with ffprobe")
+    add_remote_options(probe_parser, suppress_defaults=True)
     probe_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
     probe_selection = probe_parser.add_mutually_exclusive_group()
     probe_selection.add_argument("--stream", help="M2TS filename; defaults to the largest stream")
@@ -1116,6 +1367,7 @@ def build_parser():
     probe_parser.set_defaults(func=command_probe)
 
     extract_parser = subparsers.add_parser("extract-audio", help="copy one audio stream to an MKA file")
+    add_remote_options(extract_parser, suppress_defaults=True)
     extract_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
     extract_parser.add_argument("-o", "--output", required=True, help="output audio filename or directory; directories receive playlist-based .mka names")
     extract_selection = extract_parser.add_mutually_exclusive_group()
@@ -1138,6 +1390,7 @@ def build_parser():
         "extract-video",
         help="copy the complete selected M2TS or MPLS timeline (video and associated streams)",
     )
+    add_remote_options(video_parser, suppress_defaults=True)
     video_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
     video_parser.add_argument("-o", "--output", required=True, help="output video filename or directory; directories receive playlist-based .mkv names")
     video_selection = video_parser.add_mutually_exclusive_group()
