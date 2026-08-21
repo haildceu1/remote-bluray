@@ -26,7 +26,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 BLOCK_SIZE = 2048
 RANGE_CACHE_SIZE = 4 * 1024 * 1024
 
@@ -918,12 +918,11 @@ def virtual_input(
 def output_paths(output_name: str, playlists: list[Playlist], kind: str) -> list[Path]:
     """Build non-overlapping output paths for one or many playlist jobs."""
     output = Path(output_name)
-    if len(playlists) == 1:
-        return [output]
-
     default_suffix = ".mka" if kind == "audio" else ".mkv"
     known_suffixes = {".mka", ".mkv", ".m2ts", ".ts", ".mp4"}
     if output.suffix.casefold() in known_suffixes:
+        if len(playlists) == 1:
+            return [output]
         directory = output.parent
         prefix = output.stem + "-"
         suffix = output.suffix
@@ -1097,7 +1096,7 @@ def build_parser():
 
     extract_parser = subparsers.add_parser("extract-audio", help="copy one audio stream to an MKA file")
     extract_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
-    extract_parser.add_argument("-o", "--output", required=True, help="output audio filename, usually .mka")
+    extract_parser.add_argument("-o", "--output", required=True, help="output audio filename or directory; directories receive playlist-based .mka names")
     extract_selection = extract_parser.add_mutually_exclusive_group()
     extract_selection.add_argument("--stream", help="M2TS filename; defaults to the largest stream")
     extract_selection.add_argument(
@@ -1119,7 +1118,7 @@ def build_parser():
         help="copy the complete selected M2TS or MPLS timeline (video and associated streams)",
     )
     video_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
-    video_parser.add_argument("-o", "--output", required=True, help="output video/container filename, usually .mkv")
+    video_parser.add_argument("-o", "--output", required=True, help="output video filename or directory; directories receive playlist-based .mkv names")
     video_selection = video_parser.add_mutually_exclusive_group()
     video_selection.add_argument("--stream", help="M2TS filename; defaults to the largest stream")
     video_selection.add_argument(
