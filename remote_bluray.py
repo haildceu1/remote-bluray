@@ -26,7 +26,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 BLOCK_SIZE = 2048
 RANGE_CACHE_SIZE = 4 * 1024 * 1024
 
@@ -937,6 +937,10 @@ def output_paths(output_name: str, playlists: list[Playlist], kind: str) -> list
 
 
 def input_has_audio(input_args: list[str]) -> bool:
+    return bool(input_audio_codecs(input_args))
+
+
+def input_audio_codecs(input_args: list[str]) -> set[str]:
     command = [
         get_executable("ffprobe"),
         "-hide_banner",
@@ -945,14 +949,22 @@ def input_has_audio(input_args: list[str]) -> bool:
         "-select_streams",
         "a",
         "-show_entries",
-        "stream=index",
+        "stream=codec_name",
         "-of",
-        "csv=p=0",
+        "json",
     ] + input_args
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode:
-        raise RuntimeError(result.stderr.strip() or "ffprobe failed while checking audio streams")
-    return bool(result.stdout.strip())
+        raise RuntimeError(result.stderr.strip() or "ffprobe failed while checking audio codecs")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as error:
+        raise RuntimeError("ffprobe returned invalid JSON while checking audio codecs") from error
+    return {
+        str(stream.get("codec_name", "")).casefold()
+        for stream in payload.get("streams", [])
+        if stream.get("codec_name")
+    }
 
 
 def command_list(args):
@@ -1013,6 +1025,10 @@ def command_extract_audio(args):
                 if playlist and not has_audio:
                     print(f"\nSkip: {playlist.name} does not contain an audio stream")
                     continue
+                audio_codecs = input_audio_codecs(input_args)
+                audio_codec = "pcm_s24le" if "pcm_bluray" in audio_codecs else "copy"
+                if audio_codec == "pcm_s24le":
+                    print("Audio: pcm_bluray -> pcm_s24le (lossless Matroska-compatible conversion)")
                 output.parent.mkdir(parents=True, exist_ok=True)
                 command = [
                     get_executable("ffmpeg"),
@@ -1022,7 +1038,7 @@ def command_extract_audio(args):
                     "-map",
                     args.map,
                     "-c:a",
-                    "copy",
+                    audio_codec,
                 ]
                 if args.duration:
                     command.extend(["-t", args.duration])
@@ -1056,6 +1072,13 @@ def command_extract_video(args):
             playlist_name = playlist.name if playlist else None
             with virtual_input(image, server, args.stream, playlist_name) as selected:
                 input_args, label = selected
+                audio_codecs = input_audio_codecs(input_args)
+                if "pcm_bluray" in audio_codecs:
+                    codec_args = ["-c", "copy", "-c:a", "pcm_s24le"]
+                else:
+                    codec_args = ["-c", "copy"]
+                if "pcm_bluray" in audio_codecs:
+                    print("Audio: pcm_bluray -> pcm_s24le (lossless Matroska-compatible conversion)")
                 command = [
                     get_executable("ffmpeg"),
                     "-hide_banner",
@@ -1063,9 +1086,7 @@ def command_extract_video(args):
                 ] + input_args + [
                     "-map",
                     args.map,
-                    "-c",
-                    "copy",
-                ]
+                ] + codec_args
                 if args.duration:
                     command.extend(["-t", args.duration])
                 command.extend(["-y", str(output)])
