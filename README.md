@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.1.0-py3-none-any.whl
+python -m pip install remote_bluray-0.1.1-py3-none-any.whl
 ```
 
 依赖和工具：

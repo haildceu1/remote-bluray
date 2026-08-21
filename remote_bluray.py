@@ -26,7 +26,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 BLOCK_SIZE = 2048
 RANGE_CACHE_SIZE = 4 * 1024 * 1024
 
@@ -90,11 +90,16 @@ def decode_file_entry(data: bytes, partition: int) -> dict:
     if tag not in (261, 266):
         raise RuntimeError(f"Expected UDF File Entry, got descriptor tag {tag}")
     if tag == 261:
-        ea_offset, ad_offset = 168, 176
+        ea_offset, ad_base = 168, 176
     else:
-        ea_offset, ad_offset = 208, 216
+        ea_offset, ad_base = 208, 216
     l_ea = u32(data, ea_offset)
     l_ad = u32(data, ea_offset + 4)
+    # Allocation descriptors follow the Extended Attributes area.  Extended
+    # File Entries commonly carry 24 bytes of attributes on Blu-ray/UDF
+    # images, so using the fixed base offset would read attribute bytes as an
+    # allocation descriptor location.
+    ad_offset = ad_base + l_ea
     flags = u16(data, 34)
     ad_type = flags & 7
     entry = {
