@@ -29,7 +29,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -220,6 +220,36 @@ class Playlist:
         if self.duration_seconds <= 0:
             return 0.0
         return self.size_bytes * 8 / self.duration_seconds / 1_000_000
+
+    @property
+    def looping_period(self) -> int | None:
+        """Return the repeated play-item cycle length, if this is a loop."""
+        item_count = len(self.items)
+        if item_count < 3:
+            return None
+
+        # A menu playlist can repeat one item or a short sequence of items
+        # many times.  Require at least three cycles and near-perfect
+        # periodicity so ordinary multi-segment feature playlists are not
+        # discarded merely because they reuse a clip.
+        for period in range(1, item_count // 3 + 1):
+            cycle_count = item_count / period
+            if cycle_count < 3:
+                continue
+            matches = sum(
+                self.items[index] == self.items[index % period]
+                for index in range(item_count)
+            )
+            if matches / item_count < 0.95:
+                continue
+            cycle_duration = sum(item.duration_seconds for item in self.items[:period])
+            if cycle_duration > 0 and self.duration_seconds / cycle_duration >= 3:
+                return period
+        return None
+
+    @property
+    def is_looping(self) -> bool:
+        return self.looping_period is not None
 
 
 def parse_mpls(data: bytes, name: str = "") -> Playlist:
@@ -1003,13 +1033,22 @@ def select_playlists(
             raise ValueError("feat mode requires --min-duration")
         threshold = parse_duration(min_duration)
         main = main_playlist(playlists)
-        selected = [
-            playlist
-            for playlist in playlists
-            if playlist.name.casefold() != main.name.casefold()
-            and playlist.duration_seconds >= threshold
-            and playlist.duration_seconds <= main.duration_seconds
-        ]
+        selected = []
+        for playlist in playlists:
+            if playlist.name.casefold() == main.name.casefold():
+                continue
+            if playlist.is_looping:
+                print(
+                    f"Skip: {playlist.name} appears to be a looping playlist "
+                    f"(period={playlist.looping_period}, "
+                    f"{len(playlist.items)} play item(s))"
+                )
+                continue
+            if (
+                playlist.duration_seconds >= threshold
+                and playlist.duration_seconds <= main.duration_seconds
+            ):
+                selected.append(playlist)
         return sorted(selected, key=lambda playlist: (-playlist.size_bytes, playlist.name.casefold()))
 
     raise ValueError("Specify --playlist, --mode main, or --mode feat")

@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.2.0-py3-none-any.whl
+python -m pip install remote_bluray-0.2.1-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -168,6 +168,8 @@ python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --
 `feat` 可能产生多个文件，`-o` 建议指定目录；每个结果会以播放列表编号命名。视频模式会提取所有关联流，音频模式只提取指定音轨。
 
 此外，`feat` 会自动排除时长超过 main 本身时长的播放列表。main 判定会对重复引用的同一个 `.m2ts` 只计一次，避免把原盘中的循环/混淆播放列表误判成主片。
+
+`feat` 还会跳过周期性重复的菜单/引导播放列表：播放项序列至少重复 3 个周期且重复度达到 95% 时，会被识别为循环列表，不会因为循环后的总时长很长而误提取。
 
 正式提取前可加 `--duration 1` 做 1 秒冒烟测试：
 
