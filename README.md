@@ -10,10 +10,12 @@
 
 ## 环境
 
-明确使用 conda `base`：
+使用 Python 自带的 `venv`，不依赖 Conda：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 --version
+C:\Python314\python.exe -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python --version
 ```
 
 ## 安装
@@ -23,23 +25,24 @@ conda run --no-capture-output -n base python -X utf8 --version
 在当前目录本地安装：
 
 ```powershell
-conda run --no-capture-output -n base python -m pip install .
+python -m pip install .
 remote-bluray --version
 ```
 
 从 GitHub 安装（把地址替换成实际仓库地址）：
 
 ```powershell
-conda create -n remote-bluray python=3.12 -y
-conda run --no-capture-output -n remote-bluray python -m pip install "git+https://github.com/<你的用户名>/remote-bluray.git"
-conda run --no-capture-output -n remote-bluray remote-bluray --help
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install "git+ssh://git@github.com/haildceu1/remote-bluray.git"
+remote-bluray --help
 ```
 
 构建可分发文件：
 
 ```powershell
-conda run --no-capture-output -n base python -m pip install build
-conda run --no-capture-output -n base python -m build
+python -m pip install build
+python -m build
 ```
 
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
@@ -73,13 +76,13 @@ $env:REMOTE_BLURAY_FFPROBE = "C:\tools\ffmpeg\bin\ffprobe.exe"
 
 ```powershell
 $isoUrl = (Get-Content -LiteralPath "D:\Cinema\strm\...\movie.strm" -Raw).Trim()
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py list $isoUrl
+python -X utf8 remote_bluray.py list $isoUrl
 ```
 
 ## 查看播放列表
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py list "D:\Cinema\strm\...\movie.strm"
+python -X utf8 remote_bluray.py list "D:\Cinema\strm\...\movie.strm"
 ```
 
 输出会列出：
@@ -105,19 +108,19 @@ Total Bitrate:          100.36 Mbps
 探测指定播放列表：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py probe "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls
+python -X utf8 remote_bluray.py probe "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls
 ```
 
 完整复制播放列表时间线到 Matroska（视频、音频和字幕等关联流都保留）：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls -o "D:\output\movie.mkv"
+python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls -o "D:\output\movie.mkv"
 ```
 
 按播放列表选择音轨并无损复制到 MKA：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls --map 0:a:0 -o "D:\output\movie-audio.mka"
+python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls --map 0:a:0 -o "D:\output\movie-audio.mka"
 ```
 
 `--map 0:a:0` 是第一条音频，`0:a:1` 是第二条，以此类推。多片段播放列表会按 MPLS 顺序拼接，并使用每个播放项的入点/出点；多角度播放项当前取主角度。
@@ -125,9 +128,9 @@ conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-au
 一次提取多个播放列表：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls 00004.mpls 00011.mpls -o "D:\output\movie.mkv"
+python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls 00004.mpls 00011.mpls -o "D:\output\movie.mkv"
 
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls 00004.mpls 00011.mpls --map 0:a:0 -o "D:\output\audio.mka"
+python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls 00004.mpls 00011.mpls --map 0:a:0 -o "D:\output\audio.mka"
 ```
 
 多列表时 `-o` 会作为输出前缀或目录使用，例如上面的命令会生成 `movie-00001.mkv`、`movie-00004.mkv`、`movie-00011.mkv`。没有音频轨的列表会在 `extract-audio` 中跳过并提示，不会影响其它列表。
@@ -137,15 +140,15 @@ conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-au
 `main` 模式按每个播放列表引用的 `.m2ts` 文件总大小选择最大的列表：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --mode main -o "D:\output\main.mkv"
+python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --mode main -o "D:\output\main.mkv"
 ```
 
 `feat` 模式先排除上述 main 列表，再提取时长达到阈值的其它列表。阈值支持秒数或 `H:M:S(.ms)`：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --mode feat --min-duration 60 -o "D:\output\features"
+python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --mode feat --min-duration 60 -o "D:\output\features"
 
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --mode feat --min-duration 0:02:00 --map 0:a:0 -o "D:\output\feature-audio"
+python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --mode feat --min-duration 0:02:00 --map 0:a:0 -o "D:\output\feature-audio"
 ```
 
 `feat` 可能产生多个文件，`-o` 建议指定目录；每个结果会以播放列表编号命名。视频模式会提取所有关联流，音频模式只提取指定音轨。
@@ -155,7 +158,7 @@ conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-au
 正式提取前可加 `--duration 1` 做 1 秒冒烟测试：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00000.mpls --duration 1 -o "D:\output\smoke.mkv"
+python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00000.mpls --duration 1 -o "D:\output\smoke.mkv"
 ```
 
 ## 直接选择单个 M2TS
@@ -163,7 +166,7 @@ conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-vi
 不使用播放列表时，仍可直接指定 `.m2ts`：
 
 ```powershell
-conda run --no-capture-output -n base python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --stream 00000.m2ts --map 0:a:0 -o "D:\output\audio.mka"
+python -X utf8 remote_bluray.py extract-audio "D:\Cinema\strm\...\movie.strm" --stream 00000.m2ts --map 0:a:0 -o "D:\output\audio.mka"
 ```
 
 不指定 `--stream` 时默认选择最大的 M2TS。需要完整主片时建议优先使用 `--playlist`，因为播放列表才包含正确的入点、出点和片段顺序。
