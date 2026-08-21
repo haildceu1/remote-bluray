@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.3.0-py3-none-any.whl
+python -m pip install remote_bluray-0.4.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -104,33 +104,19 @@ python -X utf8 remote_bluray.py list "D:\Cinema\strm\...\movie.strm"
 - 有效 `.mpls` 播放列表数量；`.mpls.backup` 不计入数量。
 - 每个列表的名称、时长、对应文件总大小和总码率。
 - 每个列表引用的 M2TS 文件；重复引用的文件会显示引用次数。
-- VIDEO、AUDIO、SUBTITLES 分组，以及每条流的 codec 和语言；纯音频列表或无字幕列表也会明确显示。
+- Video、Audio、Subtitles 紧凑分组，以及每条流的 codec 和语言；重复轨道会合并显示数量，纯音频列表或无字幕列表显示为 `-`。
 
 格式示例：
 
 ```text
-Name:                   00002.MPLS
-Length:                 1:33:16.674 (h:m:s.ms)
-Size:                   70,207,316,544 bytes
-Total Bitrate:          100.36 Mbps
+Playlists: 13 (excluding .mpls.backup)
 
-M2TS:
-  00006.m2ts (referenced 100 times)
-
-VIDEO:
-Codec                           Language
-----------------------------------------
-AVC Video                        -
-
-AUDIO:
-Codec                           Language
-----------------------------------------
-Blu-ray LPCM Audio               English
-
-SUBTITLES:
-Codec                           Language
-----------------------------------------
-(none)
+[00002.MPLS]
+  Length: 1:33:16.674  |  Size: 70,207,316,544 bytes  |  Bitrate: 100.36 Mbps
+  M2TS: 00006.m2ts x100
+  Video: MPEG-H HEVC Video
+  Audio: DTS-HD Master Audio (English) x2, Dolby Digital Audio (French)
+  Subtitles: Presentation Graphics (English), Presentation Graphics (Chinese) x2
 ```
 
 例如测试原盘识别到 12 个有效播放列表，主片是 `00001.mpls`，而不是简单按文件名猜测。

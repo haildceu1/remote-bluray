@@ -17,6 +17,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import textwrap
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -1163,10 +1164,10 @@ def select_playlists(
 def playlist_summary(playlist: Playlist) -> str:
     display_name = playlist.name.rsplit(".", 1)[0] + ".MPLS"
     return (
-        f"Name:                   {display_name}\n"
-        f"Length:                 {format_duration(playlist.duration_seconds)} (h:m:s.ms)\n"
-        f"Size:                   {playlist.size_bytes:,} bytes\n"
-        f"Total Bitrate:          {playlist.total_bitrate_mbps:.2f} Mbps"
+        f"[{display_name}]\n"
+        f"  Length: {format_duration(playlist.duration_seconds)}  |  "
+        f"Size: {playlist.size_bytes:,} bytes  |  "
+        f"Bitrate: {playlist.total_bitrate_mbps:.2f} Mbps"
     )
 
 
@@ -1426,17 +1427,36 @@ def playlist_stream_metadata(
     return merged
 
 
-def format_stream_group(title: str, streams: list[dict], stream_type: str) -> str:
+def format_labeled_values(label: str, values: list[str], width: int = 100) -> list[str]:
+    text = ", ".join(values) if values else "-"
+    prefix = f"  {label}: "
+    return textwrap.wrap(
+        text,
+        width=width,
+        initial_indent=prefix,
+        subsequent_indent=" " * len(prefix),
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [prefix.rstrip()]
+
+
+def format_stream_group(title: str, streams: list[dict], stream_type: str) -> list[str]:
     selected = [stream for stream in streams if stream.get("codec_type") == stream_type]
-    lines = [f"{title}:", "Codec                           Language", "-"]
-    if not selected:
-        lines.append("(none)")
-        return "\n".join(lines)
+    grouped: OrderedDict[tuple[str, str], int] = OrderedDict()
     for stream in selected:
+        codec = display_codec(stream)
         tags = stream.get("tags") or {}
         language = tags.get("language") or tags.get("LANGUAGE")
-        lines.append(f"{display_codec(stream):<32} {display_language(language)}")
-    return "\n".join(lines)
+        key = (codec, display_language(language))
+        grouped[key] = grouped.get(key, 0) + 1
+
+    values = []
+    for (codec, language), count in grouped.items():
+        value = codec if language == "-" else f"{codec} ({language})"
+        if count > 1:
+            value += f" x{count}"
+        values.append(value)
+    return format_labeled_values(title, values)
 
 
 def format_playlist_details(
@@ -1445,20 +1465,15 @@ def format_playlist_details(
     cache: dict[str, list[dict]],
 ) -> str:
     streams = playlist_stream_metadata(playlist, server, cache)
-    lines = ["M2TS:"]
+    m2ts = []
     for name, count in playlist_m2ts_names(playlist):
-        suffix = f" (referenced {count} times)" if count > 1 else ""
-        lines.append(f"  {name}{suffix}")
-    lines.extend(
-        [
-            "",
-            format_stream_group("VIDEO", streams, "video"),
-            "",
-            format_stream_group("AUDIO", streams, "audio"),
-            "",
-            format_stream_group("SUBTITLES", streams, "subtitle"),
-        ]
-    )
+        suffix = f" x{count}" if count > 1 else ""
+        m2ts.append(f"{name}{suffix}")
+    lines = [playlist_summary(playlist)]
+    lines.extend(format_labeled_values("M2TS", m2ts))
+    lines.extend(format_stream_group("Video", streams, "video"))
+    lines.extend(format_stream_group("Audio", streams, "audio"))
+    lines.extend(format_stream_group("Subtitles", streams, "subtitle"))
     return "\n".join(lines)
 
 
@@ -1475,15 +1490,13 @@ def image_from_args(args) -> RemoteUdfImage:
 def command_list(args):
     image = image_from_args(args)
     playlists = image.playlist_candidates()
-    print(f"Playlist Count:          {len(playlists)}")
-    print("（不计入 .mpls.backup）\n")
+    print(f"Playlists: {len(playlists)} (excluding .mpls.backup)\n")
     with VirtualFileServer(image, verbose=args.verbose) as server:
         stream_cache: dict[str, list[dict]] = {}
-        for playlist in playlists:
-            print(playlist_summary(playlist))
-            print()
-            print(format_playlist_details(playlist, server, stream_cache))
-            print("\n")
+        for index, playlist in enumerate(playlists):
+            if index:
+                print()
+            print(format_playlist_details(playlist, server, stream_cache), flush=True)
 
 
 def command_probe(args):
