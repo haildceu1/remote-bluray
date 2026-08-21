@@ -8,7 +8,7 @@ BDMV/STREAM/*.m2ts URL without downloading the whole ISO first.
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -29,7 +29,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -206,6 +206,7 @@ class Playlist:
     size_bytes: int = 0
     unique_size_bytes: int = 0
     audio_stream_count: int = -1
+    stream_metadata: tuple[tuple[str, str, int], ...] = ()
 
     @property
     def duration_seconds(self) -> float:
@@ -252,13 +253,103 @@ class Playlist:
         return self.looping_period is not None
 
 
+def parse_mpls_stream(
+    data: bytes,
+    cursor: int,
+    end: int,
+    stream_type: str,
+) -> tuple[tuple[str, str, int] | None, int]:
+    """Read one MPLS STN stream entry and return its language metadata."""
+    if cursor >= end:
+        return None, end
+    descriptor_length = data[cursor]
+    descriptor_end = cursor + 1 + descriptor_length
+    if descriptor_length < 1 or descriptor_end > end:
+        return None, end
+
+    # The first descriptor contains stream type/PID information.  The second
+    # descriptor contains the coding type and, for audio/subtitle streams, the
+    # three-letter ISO 639 language code.
+    if descriptor_end >= end:
+        return None, end
+    coding_length = data[descriptor_end]
+    coding_start = descriptor_end + 1
+    coding_end = coding_start + coding_length
+    if coding_length < 1 or coding_end > end:
+        return None, end
+
+    coding_type = data[coding_start]
+    language = ""
+    if coding_type in {
+        0x03,
+        0x04,
+        0x80,
+        0x81,
+        0x82,
+        0x83,
+        0x84,
+        0x85,
+        0x86,
+        0xA1,
+        0xA2,
+    }:
+        language_start = coding_start + 2
+    elif coding_type in {0x90, 0x91}:
+        language_start = coding_start + 1
+    elif coding_type == 0x92:
+        language_start = coding_start + 2
+    else:
+        language_start = -1
+
+    if language_start >= 0 and language_start + 3 <= coding_end:
+        language = data[language_start : language_start + 3].decode(
+            "ascii", "replace"
+        ).strip("\x00 ")
+
+    return (stream_type, language, coding_type), coding_end
+
+
+def parse_stn_stream_metadata(
+    data: bytes,
+    stn_start: int,
+    item_end: int,
+) -> list[tuple[str, str, int]]:
+    """Parse primary video/audio/PG language entries from an MPLS STN block."""
+    if stn_start + 16 > item_end:
+        return []
+    stn_length = be16(data, stn_start)
+    stn_end = min(item_end, stn_start + 2 + stn_length)
+    if stn_end < stn_start + 16:
+        return []
+
+    num_video = data[stn_start + 4]
+    num_audio = data[stn_start + 5]
+    num_pg = data[stn_start + 6]
+    num_pip_pg = data[stn_start + 10]
+    cursor = stn_start + 16
+    metadata: list[tuple[str, str, int]] = []
+
+    for stream_type, count in (
+        ("video", num_video),
+        ("audio", num_audio),
+        ("subtitle", num_pg + num_pip_pg),
+    ):
+        for _ in range(count):
+            stream, cursor = parse_mpls_stream(data, cursor, stn_end, stream_type)
+            if stream is None:
+                return metadata
+            metadata.append(stream)
+
+    return metadata
+
+
 def parse_mpls(data: bytes, name: str = "") -> Playlist:
     """Parse the primary play items from a Blu-ray MPLS playlist.
 
     The fields used here follow libbluray's mpls_parse implementation.  The
-    parser intentionally focuses on the primary timeline: secondary paths,
-    playlist marks, and stream metadata are not required to build an ffmpeg
-    concat input.
+    parser intentionally focuses on the primary timeline.  It also keeps the
+    primary stream language metadata from the MPLS STN block so ``list`` can
+    describe tracks without downloading or fully decoding every M2TS.
     """
     if len(data) < 20 or data[:4] != b"MPLS":
         raise RuntimeError(f"Invalid MPLS header: {name or '<unnamed>'}")
@@ -276,6 +367,8 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
     cursor = list_pos + 10
     items: list[PlaylistItem] = []
     audio_counts: list[int] = []
+    stream_metadata: list[tuple[str, str, int]] = []
+    stream_metadata_counts: Counter[tuple[str, str, int]] = Counter()
     for index in range(item_count):
         if cursor + 2 > playlist_end:
             raise RuntimeError(f"MPLS play item {index} is truncated: {name}")
@@ -305,10 +398,22 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
             stn_start = item_start + 34 + (angle_count - 1) * 10
         if stn_start + 6 <= item_end:
             audio_counts.append(data[stn_start + 5])
+            item_metadata = parse_stn_stream_metadata(data, stn_start, item_end)
+            item_counts = Counter(item_metadata)
+            for metadata, count in item_counts.items():
+                additional = count - stream_metadata_counts[metadata]
+                if additional > 0:
+                    stream_metadata.extend([metadata] * additional)
+                    stream_metadata_counts[metadata] = count
         cursor = item_end
 
     audio_stream_count = max(audio_counts) if audio_counts else -1
-    return Playlist(name=name, items=tuple(items), audio_stream_count=audio_stream_count)
+    return Playlist(
+        name=name,
+        items=tuple(items),
+        audio_stream_count=audio_stream_count,
+        stream_metadata=tuple(stream_metadata),
+    )
 
 
 def source_to_url(source: str | Path) -> str:
@@ -774,6 +879,7 @@ class RemoteUdfImage:
                     size_bytes=size_bytes,
                     unique_size_bytes=sum(clip_sizes.values()),
                     audio_stream_count=playlist.audio_stream_count,
+                    stream_metadata=playlist.stream_metadata,
                 )
             )
         return sorted(playlists, key=lambda playlist: playlist.name.casefold())
@@ -1168,6 +1274,194 @@ def input_audio_codecs(input_args: list[str]) -> set[str]:
     }
 
 
+def probe_stream_metadata(input_args: list[str]) -> list[dict]:
+    command = [
+        get_executable("ffprobe"),
+        "-hide_banner",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name,profile:stream_tags=language",
+        "-of",
+        "json",
+    ] + input_args
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "ffprobe failed while reading stream metadata")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as error:
+        raise RuntimeError("ffprobe returned invalid JSON while reading stream metadata") from error
+    return list(payload.get("streams", []))
+
+
+LANGUAGE_NAMES = {
+    "chi": "Chinese",
+    "zho": "Chinese",
+    "cmn": "Chinese",
+    "eng": "English",
+    "en": "English",
+    "fra": "French",
+    "fre": "French",
+    "fr": "French",
+    "jpn": "Japanese",
+    "jap": "Japanese",
+    "deu": "German",
+    "ger": "German",
+    "spa": "Spanish",
+    "ita": "Italian",
+    "kor": "Korean",
+    "rus": "Russian",
+}
+
+
+def display_language(value: str | None) -> str:
+    if not value:
+        return "-"
+    normalized = value.strip().casefold()
+    return LANGUAGE_NAMES.get(normalized, value)
+
+
+def display_codec(stream: dict) -> str:
+    codec = str(stream.get("codec_name", "unknown")).casefold()
+    profile = str(stream.get("profile", "")).casefold()
+    if codec == "hevc":
+        return "MPEG-H HEVC Video"
+    if codec == "h264":
+        return "AVC Video"
+    if codec == "vc1":
+        return "VC-1 Video"
+    if codec == "mpeg2video":
+        return "MPEG-2 Video"
+    if codec == "dts":
+        if "master" in profile or "ma" in profile:
+            return "DTS-HD Master Audio"
+        if "high resolution" in profile or "hi_res" in profile:
+            return "DTS-HD High Resolution Audio"
+        return "DTS Audio"
+    if codec == "ac3":
+        return "Dolby Digital Audio"
+    if codec == "eac3":
+        return "Dolby Digital Plus Audio"
+    if codec == "truehd":
+        return "Dolby TrueHD Audio"
+    if codec == "pcm_bluray":
+        return "Blu-ray LPCM Audio"
+    if codec == "aac":
+        return "AAC Audio"
+    if codec == "hdmv_pgs_subtitle":
+        return "Presentation Graphics"
+    if codec == "dvd_subtitle":
+        return "DVD Subtitles"
+    if codec == "subrip":
+        return "SubRip"
+    return codec.replace("_", " ").upper()
+
+
+def stream_signature(stream: dict) -> tuple[str, str, str, str]:
+    tags = stream.get("tags") or {}
+    language = str(tags.get("language") or tags.get("LANGUAGE") or "").casefold()
+    return (
+        str(stream.get("codec_type", "")).casefold(),
+        str(stream.get("codec_name", "")).casefold(),
+        str(stream.get("profile", "")).casefold(),
+        language,
+    )
+
+
+def add_playlist_languages(playlist: Playlist, streams: list[dict]) -> list[dict]:
+    """Fill missing ffprobe language tags from the MPLS stream table."""
+    languages: dict[str, list[str]] = {"video": [], "audio": [], "subtitle": []}
+    for stream_type, language, _coding_type in playlist.stream_metadata:
+        languages.setdefault(stream_type, []).append(language)
+
+    positions: Counter[str] = Counter()
+    enriched = []
+    for stream in streams:
+        stream_type = str(stream.get("codec_type", "")).casefold()
+        position = positions[stream_type]
+        positions[stream_type] += 1
+        tags = stream.get("tags") or {}
+        existing = tags.get("language") or tags.get("LANGUAGE")
+        language_values = languages.get(stream_type, [])
+        if existing or position >= len(language_values) or not language_values[position]:
+            enriched.append(stream)
+            continue
+        enriched_stream = dict(stream)
+        enriched_tags = dict(tags)
+        enriched_tags["language"] = language_values[position]
+        enriched_stream["tags"] = enriched_tags
+        enriched.append(enriched_stream)
+    return enriched
+
+
+def playlist_m2ts_names(playlist: Playlist) -> list[tuple[str, int]]:
+    counts = Counter(playlist.clip_ids)
+    return [(f"{clip_id}.m2ts", counts[clip_id]) for clip_id in dict.fromkeys(playlist.clip_ids)]
+
+
+def playlist_stream_metadata(
+    playlist: Playlist,
+    server: VirtualFileServer,
+    cache: dict[str, list[dict]],
+) -> list[dict]:
+    """Probe the first clip and add stream types found only in later clips."""
+    merged: list[dict] = []
+    for clip_id, _ in playlist_m2ts_names(playlist):
+        clip_name = clip_id.rsplit(".", 1)[0]
+        if clip_name not in cache:
+            path = f"/BDMV/STREAM/{clip_name}.m2ts"
+            cache[clip_name] = probe_stream_metadata(["-i", server.file_url(path)])
+        streams = add_playlist_languages(playlist, cache[clip_name])
+        if not merged:
+            merged.extend(streams)
+            continue
+        available = Counter(stream_signature(stream) for stream in merged)
+        for stream in streams:
+            signature = stream_signature(stream)
+            if available[signature]:
+                available[signature] -= 1
+            else:
+                merged.append(stream)
+    return merged
+
+
+def format_stream_group(title: str, streams: list[dict], stream_type: str) -> str:
+    selected = [stream for stream in streams if stream.get("codec_type") == stream_type]
+    lines = [f"{title}:", "Codec                           Language", "-"]
+    if not selected:
+        lines.append("(none)")
+        return "\n".join(lines)
+    for stream in selected:
+        tags = stream.get("tags") or {}
+        language = tags.get("language") or tags.get("LANGUAGE")
+        lines.append(f"{display_codec(stream):<32} {display_language(language)}")
+    return "\n".join(lines)
+
+
+def format_playlist_details(
+    playlist: Playlist,
+    server: VirtualFileServer,
+    cache: dict[str, list[dict]],
+) -> str:
+    streams = playlist_stream_metadata(playlist, server, cache)
+    lines = ["M2TS:"]
+    for name, count in playlist_m2ts_names(playlist):
+        suffix = f" (referenced {count} times)" if count > 1 else ""
+        lines.append(f"  {name}{suffix}")
+    lines.extend(
+        [
+            "",
+            format_stream_group("VIDEO", streams, "video"),
+            "",
+            format_stream_group("AUDIO", streams, "audio"),
+            "",
+            format_stream_group("SUBTITLES", streams, "subtitle"),
+        ]
+    )
+    return "\n".join(lines)
+
+
 def image_from_args(args) -> RemoteUdfImage:
     return RemoteUdfImage(
         args.source,
@@ -1183,9 +1477,13 @@ def command_list(args):
     playlists = image.playlist_candidates()
     print(f"Playlist Count:          {len(playlists)}")
     print("（不计入 .mpls.backup）\n")
-    for playlist in playlists:
-        print(playlist_summary(playlist))
-        print()
+    with VirtualFileServer(image, verbose=args.verbose) as server:
+        stream_cache: dict[str, list[dict]] = {}
+        for playlist in playlists:
+            print(playlist_summary(playlist))
+            print()
+            print(format_playlist_details(playlist, server, stream_cache))
+            print("\n")
 
 
 def command_probe(args):
