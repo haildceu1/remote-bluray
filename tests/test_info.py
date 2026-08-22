@@ -118,12 +118,12 @@ class InfoTests(TestCase):
         )
 
     def test_random_screenshot_times_are_seeded_and_bounded(self):
-        first = app.random_screenshot_times(300, 5, seed=1948)
-        second = app.random_screenshot_times(300, 5, seed=1948)
+        first = app.random_screenshot_times(300, 5, seed=1948, start_seconds=60)
+        second = app.random_screenshot_times(300, 5, seed=1948, start_seconds=60)
 
         self.assertEqual(first, second)
         self.assertEqual(len(first), 5)
-        self.assertTrue(all(0 <= value < 300 for value in first))
+        self.assertTrue(all(60 <= value < 300 for value in first))
 
     def test_info_parser_accepts_screenshot_options(self):
         args = app.build_parser().parse_args(
@@ -142,6 +142,8 @@ class InfoTests(TestCase):
                 "1948",
                 "--screenshot-subtitle",
                 "none",
+                "--screenshot-skip-start",
+                "00:02:00",
             ]
         )
 
@@ -150,6 +152,7 @@ class InfoTests(TestCase):
         self.assertEqual(args.seed, 1948)
         self.assertEqual(args.screenshot_subtitle, "none")
         self.assertEqual(app.parse_duration(args.scan_duration), 300)
+        self.assertEqual(app.parse_duration(args.screenshot_skip_start), 120)
 
     def test_chooses_first_chinese_subtitle_stream(self):
         streams = [

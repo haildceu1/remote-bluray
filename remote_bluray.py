@@ -32,7 +32,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -1302,6 +1302,7 @@ def probe_stream_metadata(input_args: list[str]) -> list[dict]:
 
 
 INFO_PARTIAL_SECONDS = 100.0
+DEFAULT_SCREENSHOT_SKIP_START_SECONDS = 60.0
 
 
 def probe_media_info(
@@ -1915,6 +1916,7 @@ def random_screenshot_times(
     duration_seconds: float,
     count: int,
     seed: int | None = None,
+    start_seconds: float = 0.0,
 ) -> list[float]:
     """Choose sorted random timestamps from a playlist timeline."""
     if count < 0:
@@ -1923,12 +1925,19 @@ def random_screenshot_times(
         return []
     if duration_seconds <= 0:
         raise ValueError("cannot take screenshots from an empty timeline")
+    if start_seconds < 0:
+        raise ValueError("screenshot start time must be non-negative")
 
     # Leave a small margin at the end so a random frame is less likely to be
     # an end-of-file/black frame while still supporting very short clips.
     upper_bound = max(0.0, duration_seconds - 0.5)
+    if upper_bound > 0 and start_seconds >= upper_bound:
+        raise ValueError(
+            f"screenshot start time ({start_seconds:g}s) must be before "
+            f"the available timeline ({upper_bound:g}s)"
+        )
     generator = random.Random(seed) if seed is not None else random.SystemRandom()
-    return sorted(generator.uniform(0.0, upper_bound) for _ in range(count))
+    return sorted(generator.uniform(start_seconds, upper_bound) for _ in range(count))
 
 
 def screenshot_timestamp(seconds: float) -> str:
@@ -1947,9 +1956,10 @@ def save_random_screenshots(
     output_directory: str | Path,
     seed: int | None = None,
     subtitle_index: int | None = None,
+    start_seconds: float = 0.0,
 ) -> list[Path]:
     """Save random JPEG frames from the already-built virtual playlist input."""
-    times = random_screenshot_times(duration_seconds, count, seed)
+    times = random_screenshot_times(duration_seconds, count, seed, start_seconds)
     if not times:
         return []
 
@@ -2103,6 +2113,9 @@ def command_info(args):
         if args.scan == "full"
         else min(partial_seconds, playlist.duration_seconds)
     )
+    screenshot_skip_start = 0.0
+    if args.screenshot_count:
+        screenshot_skip_start = parse_duration(args.screenshot_skip_start)
 
     with VirtualFileServer(image, verbose=args.verbose) as server:
         with virtual_input(image, server, None, playlist.name) as selected:
@@ -2131,6 +2144,7 @@ def command_info(args):
                     args.screenshot_dir,
                     args.seed,
                     screenshot_subtitle[0] if screenshot_subtitle else None,
+                    screenshot_skip_start,
                 )
     print(
         format_info_report(image, playlist, media_info, args.scan, partial_seconds),
@@ -2148,6 +2162,7 @@ def command_info(args):
             print("  Subtitle: disabled", flush=True)
         else:
             print("  Subtitle: no Chinese subtitle found", flush=True)
+        print(f"  Skip start: {screenshot_skip_start:g} seconds", flush=True)
         for output in screenshot_outputs:
             print(f"  {output}", flush=True)
 
@@ -2409,6 +2424,11 @@ def build_parser():
         choices=("auto", "none"),
         default="auto",
         help="burn the first Chinese subtitle into screenshots, or disable it (default: auto)",
+    )
+    info_parser.add_argument(
+        "--screenshot-skip-start",
+        default=str(int(DEFAULT_SCREENSHOT_SKIP_START_SECONDS)),
+        help="skip this much of the beginning before choosing screenshots, in seconds or H:M:S (default: 60 seconds)",
     )
     info_parser.set_defaults(func=command_info)
 

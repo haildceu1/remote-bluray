@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.7.0-py3-none-any.whl
+python -m pip install remote_bluray-0.8.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -144,10 +144,14 @@ python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan part
 也可以随机保存主片截图；下面的命令会在前 5 分钟内随机保存 5 张 JPG 到指定目录。`--seed` 是可选的，用于复现同一组随机时间点：
 
 ```powershell
-python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial --scan-duration 00:05:00 --screenshots 5 --screenshot-dir "D:\output\screenshots" --seed 1948
+python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial --scan-duration 00:05:00 --screenshots 5 --screenshot-dir "D:\output\screenshots" --screenshot-skip-start 00:02:00 --seed 1948
 ```
 
 截图默认会自动烧录主播放列表中的第一条中文字幕（包括 PGS 位图字幕）；使用 `--screenshot-subtitle none` 可以关闭字幕烧录。报告会标记实际使用的字幕流。
+
+截图默认跳过开头 60 秒，避免片头文字；可以用 `--screenshot-skip-start` 自定义跳过时长。指定的跳过时长必须小于截图扫描范围。
+
+报告表格是按空格对齐的等宽纯文本，复制到非等宽字体或会折叠连续空格的编辑器后，短横线可能看起来错位；需要保留视觉对齐时，请粘贴到代码块或使用等宽字体查看。
 
 不指定 `--scan partial` 时，截图时间范围覆盖完整主播放列表；不指定 `--screenshots` 时不会生成截图。
 
