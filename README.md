@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.5.2-py3-none-any.whl
+python -m pip install remote_bluray-0.6.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -140,6 +140,14 @@ python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan part
 ```powershell
 python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial --scan-duration 00:05:00
 ```
+
+也可以随机保存主片截图；下面的命令会在前 5 分钟内随机保存 5 张 JPG 到指定目录。`--seed` 是可选的，用于复现同一组随机时间点：
+
+```powershell
+python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial --scan-duration 00:05:00 --screenshots 5 --screenshot-dir "D:\output\screenshots" --seed 1948
+```
+
+不指定 `--scan partial` 时，截图时间范围覆盖完整主播放列表；不指定 `--screenshots` 时不会生成截图。
 
 码率由扫描区间内各流的实际 packet 字节数计算。部分扫描适合先快速确认编码、语言和轨道布局，但码率只代表指定区间样本；如果某条字幕在指定区间没有出现 packet，其码率会显示为 `-`。报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
 

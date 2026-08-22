@@ -12,6 +12,7 @@ from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import random
 import shutil
 import struct
 import subprocess
@@ -31,7 +32,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -1849,6 +1850,92 @@ def format_info_report(
     return "\n".join(lines)
 
 
+def random_screenshot_times(
+    duration_seconds: float,
+    count: int,
+    seed: int | None = None,
+) -> list[float]:
+    """Choose sorted random timestamps from a playlist timeline."""
+    if count < 0:
+        raise ValueError("screenshot count must be non-negative")
+    if count == 0:
+        return []
+    if duration_seconds <= 0:
+        raise ValueError("cannot take screenshots from an empty timeline")
+
+    # Leave a small margin at the end so a random frame is less likely to be
+    # an end-of-file/black frame while still supporting very short clips.
+    upper_bound = max(0.0, duration_seconds - 0.5)
+    generator = random.Random(seed) if seed is not None else random.SystemRandom()
+    return sorted(generator.uniform(0.0, upper_bound) for _ in range(count))
+
+
+def screenshot_timestamp(seconds: float) -> str:
+    milliseconds = int(round(max(0.0, seconds) * 1000))
+    hours, remainder = divmod(milliseconds, 3600000)
+    minutes, remainder = divmod(remainder, 60000)
+    seconds_int, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}-{minutes:02d}-{seconds_int:02d}.{milliseconds:03d}"
+
+
+def save_random_screenshots(
+    input_args: list[str],
+    playlist: Playlist,
+    duration_seconds: float,
+    count: int,
+    output_directory: str | Path,
+    seed: int | None = None,
+) -> list[Path]:
+    """Save random JPEG frames from the already-built virtual playlist input."""
+    times = random_screenshot_times(duration_seconds, count, seed)
+    if not times:
+        return []
+
+    directory = Path(output_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    outputs: list[Path] = []
+    playlist_stem = Path(playlist.name).stem
+    for index, seconds in enumerate(times, start=1):
+        output = directory / (
+            f"{playlist_stem}-random-{index:02d}-{screenshot_timestamp(seconds)}.jpg"
+        )
+        command = [
+            get_executable("ffmpeg"),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-ss",
+            f"{seconds:.3f}",
+        ] + input_args + [
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-y",
+            str(output),
+        ]
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode:
+            raise RuntimeError(
+                result.stderr.strip()
+                or f"ffmpeg failed while creating screenshot at {seconds:.3f}s"
+            )
+        if not output.is_file():
+            raise RuntimeError(f"ffmpeg did not create screenshot: {output}")
+        outputs.append(output)
+    return outputs
+
+
 def format_labeled_values(label: str, values: list[str], width: int = 100) -> list[str]:
     text = ", ".join(values) if values else "-"
     prefix = f"  {label}: "
@@ -1937,6 +2024,12 @@ def command_info(args):
         if args.scan == "full"
         else f"first {partial_seconds:g} seconds of the main playlist"
     )
+    screenshot_outputs: list[Path] = []
+    screenshot_duration = (
+        playlist.duration_seconds
+        if args.scan == "full"
+        else min(partial_seconds, playlist.duration_seconds)
+    )
 
     with VirtualFileServer(image, verbose=args.verbose) as server:
         with virtual_input(image, server, None, playlist.name) as selected:
@@ -1951,10 +2044,23 @@ def command_info(args):
                 args.scan,
                 partial_seconds,
             )
+            if args.screenshot_count:
+                screenshot_outputs = save_random_screenshots(
+                    input_args,
+                    playlist,
+                    screenshot_duration,
+                    args.screenshot_count,
+                    args.screenshot_dir,
+                    args.seed,
+                )
     print(
         format_info_report(image, playlist, media_info, args.scan, partial_seconds),
         flush=True,
     )
+    if screenshot_outputs:
+        print("\nSCREENSHOTS:", flush=True)
+        for output in screenshot_outputs:
+            print(f"  {output}", flush=True)
 
 
 def command_probe(args):
@@ -2188,6 +2294,26 @@ def build_parser():
         "--scan-duration",
         default=str(int(INFO_PARTIAL_SECONDS)),
         help="partial scan duration in seconds or H:M:S (default: 100 seconds)",
+    )
+    info_parser.add_argument(
+        "--screenshots",
+        "--screenshot-count",
+        dest="screenshot_count",
+        type=nonnegative_int,
+        default=0,
+        metavar="N",
+        help="save N random JPEG screenshots (default: disabled)",
+    )
+    info_parser.add_argument(
+        "--screenshot-dir",
+        default="info-screenshots",
+        metavar="DIR",
+        help="directory for random screenshots (default: info-screenshots)",
+    )
+    info_parser.add_argument(
+        "--seed",
+        type=int,
+        help="optional random seed for reproducible screenshot timestamps",
     )
     info_parser.set_defaults(func=command_info)
 
