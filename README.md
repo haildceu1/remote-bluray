@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.4.0-py3-none-any.whl
+python -m pip install remote_bluray-0.5.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -120,6 +120,22 @@ Playlists: 13 (excluding .mpls.backup)
 ```
 
 例如测试原盘识别到 12 个有效播放列表，主片是 `00001.mpls`，而不是简单按文件名猜测。
+
+## 提取主片编码信息
+
+`info` 使用已有的 `main` 播放列表选择逻辑，生成接近 BDInfo 的报告，包含碟片信息、播放列表、视频、音频、字幕和 M2TS 文件明细：
+
+```powershell
+python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm"
+```
+
+默认 `--scan full` 会扫描主播放列表的完整时间线；远程原盘较大时可以使用 `--scan partial`，只读取前 100 秒：
+
+```powershell
+python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial
+```
+
+部分扫描适合先快速确认编码、语言和轨道布局，但其中由 ffprobe 测得的码率只代表前 100 秒样本；报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
 
 ## 按播放列表探测和提取
 

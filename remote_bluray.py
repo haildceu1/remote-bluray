@@ -21,6 +21,7 @@ import textwrap
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,7 +31,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -1296,6 +1297,53 @@ def probe_stream_metadata(input_args: list[str]) -> list[dict]:
     return list(payload.get("streams", []))
 
 
+INFO_PARTIAL_SECONDS = 100.0
+
+
+def probe_media_info(
+    input_args: list[str],
+    scan_mode: str = "full",
+) -> dict:
+    """Probe a playlist timeline for the detailed ``info`` report.
+
+    ``ffprobe`` normally reads the complete input while discovering format
+    duration and stream statistics.  ``-read_intervals`` keeps the partial
+    mode bounded to the first 100 seconds of the virtual playlist.
+    """
+    command = [
+        get_executable("ffprobe"),
+        "-hide_banner",
+        "-v",
+        "error",
+        "-count_packets",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+    ]
+    if scan_mode == "partial":
+        command.extend(["-read_intervals", f"%+{INFO_PARTIAL_SECONDS:g}"])
+    elif scan_mode != "full":
+        raise ValueError(f"Unknown info scan mode: {scan_mode}")
+    command.extend(input_args)
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "ffprobe failed while reading info")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as error:
+        raise RuntimeError("ffprobe returned invalid JSON while reading info") from error
+    return payload
+
+
 LANGUAGE_NAMES = {
     "chi": "Chinese",
     "zho": "Chinese",
@@ -1357,6 +1405,167 @@ def display_codec(stream: dict) -> str:
     if codec == "subrip":
         return "SubRip"
     return codec.replace("_", " ").upper()
+
+
+def info_display_codec(stream: dict) -> str:
+    """Use the longer codec names commonly found in BDInfo reports."""
+    codec = str(stream.get("codec_name", "unknown")).casefold()
+    if codec == "h264":
+        return "MPEG-4 AVC Video"
+    if codec == "hevc":
+        return "MPEG-H HEVC Video"
+    return display_codec(stream)
+
+
+def stream_language(stream: dict) -> str | None:
+    tags = stream.get("tags") or {}
+    return tags.get("language") or tags.get("LANGUAGE")
+
+
+def numeric_value(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def stream_bitrate(stream: dict) -> float | None:
+    """Return a stream bitrate in bits per second when ffprobe provides one."""
+    bitrate = numeric_value(stream.get("bit_rate"))
+    if bitrate:
+        return bitrate
+
+    # Some demuxers expose the measured bitrate as a BPS tag instead of the
+    # regular stream field.  Prefer the plain tag, then language-qualified
+    # variants such as BPS-eng.
+    tags = stream.get("tags") or {}
+    for key, value in tags.items():
+        if str(key).casefold() == "bps" or str(key).casefold().startswith("bps-"):
+            bitrate = numeric_value(value)
+            if bitrate:
+                return bitrate
+    return None
+
+
+def format_bitrate_value(value: float | None) -> str:
+    bitrate = numeric_value(value)
+    if not bitrate:
+        return "-"
+    text = f"{bitrate / 1000:.3f}".rstrip("0").rstrip(".")
+    return f"{text} kbps"
+
+
+def rational_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        text = str(value)
+        if "/" in text:
+            numerator, denominator = text.split("/", 1)
+            if int(denominator) == 0:
+                return None
+            return float(Fraction(int(numerator), int(denominator)))
+        return float(text)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def format_frame_rate(value) -> str | None:
+    frame_rate = rational_float(value)
+    if not frame_rate or frame_rate <= 0:
+        return None
+    return f"{frame_rate:.3f}".rstrip("0").rstrip(".") + " fps"
+
+
+def display_aspect_ratio(stream: dict) -> str | None:
+    value = stream.get("display_aspect_ratio")
+    if value and str(value).upper() not in {"N/A", "0:0"}:
+        return str(value)
+
+    width = numeric_value(stream.get("width"))
+    height = numeric_value(stream.get("height"))
+    if not width or not height:
+        return None
+    ratio = Fraction(int(width), int(height)).limit_denominator(100)
+    return f"{ratio.numerator}:{ratio.denominator}"
+
+
+def format_level(value) -> str | None:
+    level = numeric_value(value)
+    if not level:
+        return None
+    if level >= 10 and float(level).is_integer():
+        return f"{level / 10:.1f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def format_video_description(stream: dict) -> str:
+    values: list[str] = []
+    height = numeric_value(stream.get("height"))
+    if height:
+        height_text = str(int(height)) if height.is_integer() else str(height)
+        values.append(f"{height_text}p")
+
+    frame_rate = format_frame_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
+    if frame_rate:
+        values.append(frame_rate)
+    aspect_ratio = display_aspect_ratio(stream)
+    if aspect_ratio:
+        values.append(aspect_ratio)
+
+    profile = str(stream.get("profile") or "").strip()
+    level = format_level(stream.get("level"))
+    if profile:
+        profile_text = profile if profile.casefold().endswith("profile") else f"{profile} Profile"
+        if level:
+            profile_text += f" {level}"
+        values.append(profile_text)
+    elif level:
+        values.append(f"Level {level}")
+
+    return " / ".join(values) or "-"
+
+
+def display_channel_layout(stream: dict) -> str | None:
+    layout = str(stream.get("channel_layout") or "").strip()
+    if layout and layout.casefold() not in {"unknown", "(none)"}:
+        return layout
+    channels = numeric_value(stream.get("channels"))
+    if not channels:
+        return None
+    return {
+        1: "1.0",
+        2: "2.0",
+        6: "5.1",
+        8: "7.1",
+    }.get(int(channels), f"{int(channels)} ch")
+
+
+def format_audio_description(stream: dict) -> str:
+    values: list[str] = []
+    channel_layout = display_channel_layout(stream)
+    if channel_layout:
+        values.append(channel_layout)
+
+    sample_rate = numeric_value(stream.get("sample_rate"))
+    if sample_rate:
+        sample_text = f"{sample_rate / 1000:.3f}".rstrip("0").rstrip(".")
+        values.append(f"{sample_text} kHz")
+
+    bits = numeric_value(stream.get("bits_per_sample") or stream.get("bits_per_raw_sample"))
+    if bits:
+        values.append(f"{int(bits)}-bit")
+
+    return " / ".join(values) or "-"
+
+
+def format_subtitle_description(stream: dict) -> str:
+    tags = stream.get("tags") or {}
+    title = tags.get("title") or tags.get("TITLE")
+    return str(title) if title else "-"
 
 
 def stream_signature(stream: dict) -> tuple[str, str, str, str]:
@@ -1425,6 +1634,121 @@ def playlist_stream_metadata(
             else:
                 merged.append(stream)
     return merged
+
+
+def info_stream_rows(streams: list[dict], stream_type: str) -> list[str]:
+    selected = [stream for stream in streams if stream.get("codec_type") == stream_type]
+    lines = [
+        f"{'Codec':<32} {'Language':<16} {'Bitrate':<15} Description",
+        "-" * 100,
+    ]
+    if not selected:
+        lines.append("(none)")
+        return lines
+
+    for stream in selected:
+        codec = info_display_codec(stream)
+        language = display_language(stream_language(stream))
+        bitrate = format_bitrate_value(stream_bitrate(stream))
+        if stream_type == "video":
+            description = format_video_description(stream)
+        elif stream_type == "audio":
+            description = format_audio_description(stream)
+        else:
+            description = format_subtitle_description(stream)
+        lines.append(f"{codec:<32} {language:<16} {bitrate:<15} {description}")
+    return lines
+
+
+def udf_path_exists(image: RemoteUdfImage, path: str) -> bool:
+    try:
+        image.find(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
+def playlist_file_rows(
+    image: RemoteUdfImage,
+    playlist: Playlist,
+) -> list[str]:
+    """Format one row per unique M2TS referenced by the playlist."""
+    rows = []
+    seen: set[str] = set()
+    for item in playlist.items:
+        clip_id = item.clip_id.upper()
+        if clip_id in seen:
+            continue
+        seen.add(clip_id)
+        name = f"{clip_id}.M2TS"
+        clip = image.find(f"/BDMV/STREAM/{item.clip_id}.m2ts")
+        duration = item.duration_seconds
+        bitrate = "-"
+        if duration > 0 and clip.size > 0:
+            bitrate = f"{clip.size * 8 / duration / 1000:,.0f}"
+        rows.append(
+            f"{name:<16} {format_duration(item.in_time / 45000.0):<21} "
+            f"{format_duration(duration):<16} {clip.size:>20,} {bitrate:>14}"
+        )
+    return rows
+
+
+def format_info_report(
+    image: RemoteUdfImage,
+    playlist: Playlist,
+    media_info: dict,
+    scan_mode: str,
+) -> str:
+    label = (image.volume_id or "-").strip() or "-"
+    protection = "AACS" if udf_path_exists(image, "/AACS") else "None detected"
+    extras = "BD-Java" if (
+        udf_path_exists(image, "/BDMV/JAR")
+        or udf_path_exists(image, "/BDMV/BACKUP/JAR")
+    ) else "None detected"
+    scan_label = (
+        "Complete file"
+        if scan_mode == "full"
+        else f"First {int(INFO_PARTIAL_SECONDS)} seconds only"
+    )
+    streams = add_playlist_languages(playlist, list(media_info.get("streams", [])))
+
+    lines = [
+        "DISC INFO",
+        "",
+        f"Disc Title:     {label}",
+        f"Disc Label:     {label}",
+        f"Disc Size:      {image.remote.size:,} bytes",
+        f"Protection:     {protection}",
+        f"Extras:         {extras}",
+        f"Scanner:        remote-bluray {__version__} (ffprobe)",
+        f"Scan:           {scan_label}",
+        "",
+        "PLAYLIST REPORT:",
+        "",
+        f"Name:                   {playlist.name.upper()}",
+        f"Length:                 {format_duration(playlist.duration_seconds)} (h:m:s.ms)",
+        f"Size:                   {playlist.size_bytes:,} bytes",
+        f"Total Bitrate:          {playlist.total_bitrate_mbps:.2f} Mbps",
+        "",
+        "VIDEO:",
+        "",
+    ]
+    lines.extend(info_stream_rows(streams, "video"))
+    lines.extend(["", "AUDIO:", ""])
+    lines.extend(info_stream_rows(streams, "audio"))
+    lines.extend(["", "SUBTITLES:", ""])
+    lines.extend(info_stream_rows(streams, "subtitle"))
+    lines.extend(
+        [
+            "",
+            "FILES:",
+            "",
+            f"{'Name':<16} {'Time In':<21} {'Length':<16} {'Size':>20} {'Total Bitrate':>14}",
+            "-" * 100,
+        ]
+    )
+    lines.extend(playlist_file_rows(image, playlist))
+    return "\n".join(lines)
 
 
 def format_labeled_values(label: str, values: list[str], width: int = 100) -> list[str]:
@@ -1497,6 +1821,26 @@ def command_list(args):
             if index:
                 print()
             print(format_playlist_details(playlist, server, stream_cache), flush=True)
+
+
+def command_info(args):
+    image = image_from_args(args)
+    playlists = select_playlists(image, None, args.mode, None)
+    if len(playlists) != 1:
+        raise RuntimeError("info expects exactly one playlist")
+    playlist = playlists[0]
+    scan_label = (
+        "complete main playlist"
+        if args.scan == "full"
+        else f"first {int(INFO_PARTIAL_SECONDS)} seconds of the main playlist"
+    )
+
+    with VirtualFileServer(image, verbose=args.verbose) as server:
+        with virtual_input(image, server, None, playlist.name) as selected:
+            input_args, _label = selected
+            print(f"Scanning {playlist.name} ({scan_label})...", flush=True)
+            media_info = probe_media_info(input_args, args.scan)
+    print(format_info_report(image, playlist, media_info, args.scan), flush=True)
 
 
 def command_probe(args):
@@ -1707,6 +2051,26 @@ def build_parser():
     add_remote_options(list_parser, suppress_defaults=True)
     list_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
     list_parser.set_defaults(func=command_list)
+
+    info_parser = subparsers.add_parser(
+        "info",
+        help="report BDInfo-style encoding details for the main playlist",
+    )
+    add_remote_options(info_parser, suppress_defaults=True)
+    info_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
+    info_parser.add_argument(
+        "--mode",
+        choices=("main",),
+        default="main",
+        help="playlist selection mode (currently only main is supported)",
+    )
+    info_parser.add_argument(
+        "--scan",
+        choices=("full", "partial"),
+        default="full",
+        help="scan the complete main playlist or only its first 100 seconds (default: full)",
+    )
+    info_parser.set_defaults(func=command_info)
 
     probe_parser = subparsers.add_parser("probe", help="probe a virtual M2TS or MPLS timeline with ffprobe")
     add_remote_options(probe_parser, suppress_defaults=True)
