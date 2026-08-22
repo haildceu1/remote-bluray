@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.5.0-py3-none-any.whl
+python -m pip install remote_bluray-0.5.1-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -135,7 +135,7 @@ python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm"
 python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial
 ```
 
-部分扫描适合先快速确认编码、语言和轨道布局，但其中由 ffprobe 测得的码率只代表前 100 秒样本；报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
+码率由扫描区间内各流的实际 packet 字节数计算。部分扫描适合先快速确认编码、语言和轨道布局，但码率只代表前 100 秒样本；如果某条字幕在前 100 秒没有出现 packet，其码率会显示为 `-`。报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
 
 ## 按播放列表探测和提取
 

@@ -40,9 +40,15 @@ class InfoTests(TestCase):
 
         self.assertEqual(payload["streams"], [])
         command = run.call_args.args[0]
-        self.assertIn("-count_packets", command)
         self.assertIn("-read_intervals", command)
         self.assertIn("%+100", command)
+
+    def test_packet_bitrates_use_the_scan_window(self):
+        media_info = {"streams": [{"index": 0, "codec_type": "video"}]}
+
+        app.apply_packet_bitrates(media_info, {0: 1_000_000}, 200, "partial")
+
+        self.assertEqual(app.format_bitrate_value(media_info["streams"][0]["bit_rate"]), "80 kbps")
 
     def test_report_contains_bdinfo_style_stream_sections(self):
         media_info = {
@@ -88,6 +94,12 @@ class InfoTests(TestCase):
         self.assertIn("28.636 kbps", report)
         self.assertIn("FILES:", report)
         self.assertIn("00001.M2TS", report)
+
+    def test_cs0_volume_labels_ignore_fixed_field_padding(self):
+        self.assertEqual(
+            app.decode_cs0(b"\x08GERMANY_YEAR_ZERO\x00\x00\x00\x12"),
+            "GERMANY_YEAR_ZERO",
+        )
 
 
 if __name__ == "__main__":

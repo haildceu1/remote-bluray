@@ -31,7 +31,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -66,11 +66,14 @@ def decode_cs0(data: bytes) -> str:
     compression = data[0]
     payload = data[1:]
     if compression == 8:
-        return payload.decode("latin-1", "replace").rstrip("\x00")
+        decoded = payload.decode("latin-1", "replace")
+        return decoded.split("\x00", 1)[0].rstrip()
     if compression == 16:
         payload = payload[: len(payload) // 2 * 2]
-        return payload.decode("utf-16-be", "replace").rstrip("\x00")
-    return payload.decode("latin-1", "replace").rstrip("\x00")
+        decoded = payload.decode("utf-16-be", "replace")
+        return decoded.split("\x00", 1)[0].rstrip()
+    decoded = payload.decode("latin-1", "replace")
+    return decoded.split("\x00", 1)[0].rstrip()
 
 
 def decode_extent_ad(data: bytes, offset: int) -> dict:
@@ -1306,16 +1309,14 @@ def probe_media_info(
 ) -> dict:
     """Probe a playlist timeline for the detailed ``info`` report.
 
-    ``ffprobe`` normally reads the complete input while discovering format
-    duration and stream statistics.  ``-read_intervals`` keeps the partial
-    mode bounded to the first 100 seconds of the virtual playlist.
+    The packet pass in :func:`probe_packet_stats` supplies measured bitrates.
+    ``-read_intervals`` keeps the metadata probe bounded in partial mode.
     """
     command = [
         get_executable("ffprobe"),
         "-hide_banner",
         "-v",
         "error",
-        "-count_packets",
         "-show_streams",
         "-show_format",
         "-of",
@@ -1342,6 +1343,67 @@ def probe_media_info(
     except json.JSONDecodeError as error:
         raise RuntimeError("ffprobe returned invalid JSON while reading info") from error
     return payload
+
+
+def probe_packet_stats(
+    input_args: list[str],
+    scan_mode: str = "full",
+) -> dict[int, int]:
+    """Sum demuxed packet bytes by stream without buffering full output.
+
+    Blu-ray MPEG-TS streams often omit ``bit_rate`` in their stream metadata,
+    especially video and PGS subtitles.  Compact packet output lets us derive
+    an average bitrate while keeping the full-scan subprocess output bounded.
+    """
+    command = [
+        get_executable("ffprobe"),
+        "-hide_banner",
+        "-v",
+        "error",
+        "-show_packets",
+        "-show_entries",
+        "packet=stream_index,size",
+        "-of",
+        "compact=p=1:nk=0",
+    ]
+    if scan_mode == "partial":
+        command.extend(["-read_intervals", f"%+{INFO_PARTIAL_SECONDS:g}"])
+    elif scan_mode != "full":
+        raise ValueError(f"Unknown info scan mode: {scan_mode}")
+    command.extend(input_args)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    packet_sizes: dict[int, int] = {}
+    assert process.stdout is not None
+    for line in process.stdout:
+        if not line.startswith("packet|"):
+            continue
+        fields = {}
+        for field in line.rstrip("\r\n").split("|")[1:]:
+            key, separator, value = field.partition("=")
+            if separator:
+                fields[key] = value
+        try:
+            stream_index = int(fields["stream_index"])
+            packet_size = int(fields["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if packet_size > 0:
+            packet_sizes[stream_index] = packet_sizes.get(stream_index, 0) + packet_size
+
+    process.stdout.close()
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    returncode = process.wait()
+    if returncode:
+        raise RuntimeError(stderr.strip() or "ffprobe failed while measuring packet bitrates")
+    return packet_sizes
 
 
 LANGUAGE_NAMES = {
@@ -1448,6 +1510,34 @@ def stream_bitrate(stream: dict) -> float | None:
             if bitrate:
                 return bitrate
     return None
+
+
+def apply_packet_bitrates(
+    media_info: dict,
+    packet_sizes: dict[int, int],
+    duration_seconds: float,
+    scan_mode: str,
+) -> dict:
+    """Add measured average bitrates to the ffprobe stream dictionaries."""
+    if duration_seconds <= 0:
+        return media_info
+    measured_duration = (
+        min(INFO_PARTIAL_SECONDS, duration_seconds)
+        if scan_mode == "partial"
+        else duration_seconds
+    )
+    if measured_duration <= 0:
+        return media_info
+
+    for stream in media_info.get("streams", []):
+        try:
+            stream_index = int(stream.get("index"))
+        except (TypeError, ValueError):
+            continue
+        byte_count = packet_sizes.get(stream_index, 0)
+        if byte_count > 0:
+            stream["bit_rate"] = str(byte_count * 8 / measured_duration)
+    return media_info
 
 
 def format_bitrate_value(value: float | None) -> str:
@@ -1840,6 +1930,13 @@ def command_info(args):
             input_args, _label = selected
             print(f"Scanning {playlist.name} ({scan_label})...", flush=True)
             media_info = probe_media_info(input_args, args.scan)
+            packet_sizes = probe_packet_stats(input_args, args.scan)
+            apply_packet_bitrates(
+                media_info,
+                packet_sizes,
+                playlist.duration_seconds,
+                args.scan,
+            )
     print(format_info_report(image, playlist, media_info, args.scan), flush=True)
 
 
