@@ -32,7 +32,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -1933,8 +1933,9 @@ def random_screenshot_times(
     upper_bound = max(0.0, duration_seconds - 0.5)
     if upper_bound > 0 and start_seconds >= upper_bound:
         raise ValueError(
-            f"screenshot start time ({start_seconds:g}s) must be before "
-            f"the available timeline ({upper_bound:g}s)"
+            f"no screenshot time remains after skipping {start_seconds:g}s; "
+            f"the available timeline ends at {upper_bound:g}s. "
+            "Increase --scan-duration or lower --screenshot-skip-start."
         )
     generator = random.Random(seed) if seed is not None else random.SystemRandom()
     return sorted(generator.uniform(start_seconds, upper_bound) for _ in range(count))
@@ -2136,16 +2137,19 @@ def command_info(args):
                 args.screenshot_subtitle,
             )
             if args.screenshot_count:
-                screenshot_outputs = save_random_screenshots(
-                    input_args,
-                    playlist,
-                    screenshot_duration,
-                    args.screenshot_count,
-                    args.screenshot_dir,
-                    args.seed,
-                    screenshot_subtitle[0] if screenshot_subtitle else None,
-                    screenshot_skip_start,
-                )
+                try:
+                    screenshot_outputs = save_random_screenshots(
+                        input_args,
+                        playlist,
+                        screenshot_duration,
+                        args.screenshot_count,
+                        args.screenshot_dir,
+                        args.seed,
+                        screenshot_subtitle[0] if screenshot_subtitle else None,
+                        screenshot_skip_start,
+                    )
+                except ValueError as error:
+                    raise SystemExit(f"Error: {error}") from error
     print(
         format_info_report(image, playlist, media_info, args.scan, partial_seconds),
         flush=True,

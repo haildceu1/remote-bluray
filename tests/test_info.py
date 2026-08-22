@@ -125,6 +125,10 @@ class InfoTests(TestCase):
         self.assertEqual(len(first), 5)
         self.assertTrue(all(60 <= value < 300 for value in first))
 
+    def test_screenshot_skip_must_leave_a_time_window(self):
+        with self.assertRaisesRegex(ValueError, "Increase --scan-duration"):
+            app.random_screenshot_times(300, 1, start_seconds=300)
+
     def test_info_parser_accepts_screenshot_options(self):
         args = app.build_parser().parse_args(
             [
