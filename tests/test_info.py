@@ -197,6 +197,15 @@ class InfoTests(TestCase):
             "ed2k://|file|电影 2024.iso|44942753792|ABCDEF|/",
         )
 
+        query_image = SimpleNamespace(
+            url="https://example.test/d/opaque.iso?/%E7%8B%99%E5%87%BB%E7%94%B5%E8%AF%9D%E4%BA%AD%20%282003%29.iso",
+            remote=SimpleNamespace(size=123),
+        )
+        self.assertEqual(
+            app.build_ed2k_link(query_image, args),
+            "ed2k://|file|狙击电话亭 (2003).iso|123|ABCDEF|/",
+        )
+
     def test_md4_and_small_ed2k_hash_match_known_vectors(self):
         self.assertEqual(
             app.md4_digest(b"").hex(),

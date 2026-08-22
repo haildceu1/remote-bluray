@@ -97,9 +97,20 @@ def calculate_ed2k_hash(image: RemoteUdfImage, progress_file=None) -> str:
     part_hashes: list[bytes] = []
     offset = 0
     total_size = image.remote.size
+    stream_all = getattr(image.remote, "iter_all", None)
+    data_iterator = iter(stream_all(ED2K_PART_SIZE)) if callable(stream_all) else None
     while offset < total_size:
         part_size = min(ED2K_PART_SIZE, total_size - offset)
-        data = image.remote.read_range(offset, part_size)
+        if data_iterator is None:
+            data = image.remote.read_range(offset, part_size)
+        else:
+            try:
+                data = next(data_iterator)
+            except StopIteration as error:
+                raise IOError(
+                    f"Short read while calculating ED2K hash at {offset}: "
+                    f"expected {part_size} more bytes"
+                ) from error
         if len(data) != part_size:
             raise IOError(
                 f"Short read while calculating ED2K hash at {offset}: "
@@ -114,6 +125,13 @@ def calculate_ed2k_hash(image: RemoteUdfImage, progress_file=None) -> str:
                 file=progress_file,
                 flush=True,
             )
+    if total_size == 0 and data_iterator is not None:
+        try:
+            next(data_iterator)
+        except StopIteration:
+            pass
+        else:
+            raise IOError("Remote stream returned data for an empty file")
     return ed2k_hash_from_parts(part_hashes, total_size)
 
 
@@ -718,6 +736,38 @@ class RemoteRangeReader:
             start += count
             self._schedule_prefetch(index)
         return bytes(output)
+
+    def iter_all(self, chunk_size: int) -> Iterator[bytes]:
+        """Stream the complete remote object through one full-range request."""
+        session = self._session_for_thread()
+        response = session.get(
+            self.final_url,
+            headers={"Range": f"bytes=0-{self.size - 1}"},
+            stream=True,
+            timeout=60,
+        )
+        try:
+            if response.status_code not in (200, 206):
+                raise RuntimeError(f"Full Range request failed: HTTP {response.status_code}")
+            if response.status_code == 206:
+                content_range = response.headers.get("Content-Range", "")
+                expected_range = f"bytes 0-{self.size - 1}/{self.size}"
+                if content_range != expected_range:
+                    raise RuntimeError(
+                        f"Full Range response has unexpected Content-Range: {content_range}"
+                    )
+            pending = bytearray()
+            for piece in response.iter_content(chunk_size=min(chunk_size, 1024 * 1024)):
+                if not piece:
+                    continue
+                pending.extend(piece)
+                while len(pending) >= chunk_size:
+                    yield bytes(pending[:chunk_size])
+                    del pending[:chunk_size]
+            if pending:
+                yield bytes(pending)
+        finally:
+            response.close()
 
     def read_block(self, lba: int) -> bytes:
         data = self.read_range(lba * BLOCK_SIZE, BLOCK_SIZE)
@@ -2292,7 +2342,11 @@ def tmdb_api_key(module, configured_key: str | None) -> str:
 
 
 def source_filename(image: RemoteUdfImage) -> str:
-    path = unquote(urlsplit(image.url).path).rstrip("/")
+    parsed = urlsplit(image.url)
+    query_filename = unquote(parsed.query).lstrip("/").rsplit("/", 1)[-1]
+    if query_filename.lower().endswith((".iso", ".strm")):
+        return query_filename
+    path = unquote(parsed.path).rstrip("/")
     filename = path.rsplit("/", 1)[-1]
     return filename or "remote-bluray.iso"
 
