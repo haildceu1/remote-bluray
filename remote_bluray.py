@@ -1875,16 +1875,15 @@ def playlist_stream_metadata(
 
 def info_table_header(columns: list[tuple[str, int]]) -> list[str]:
     header = " ".join(f"{name:<{width}}" for name, width in columns).rstrip()
-    divider = " ".join(
-        f"{'-' * len(name):<{width}}" for name, width in columns
-    ).rstrip()
-    return [header, divider]
+    # Match the standard BDInfo layout: the column headings are followed by
+    # a blank line, a standalone separator, and another blank line.
+    return [header, "", "---", ""]
 
 
 def info_stream_rows(streams: list[dict], stream_type: str) -> list[str]:
     selected = [stream for stream in streams if stream.get("codec_type") == stream_type]
     if stream_type == "video":
-        columns = [("Codec", 32), ("Bitrate", 15), ("Description", 1)]
+        columns = [("Codec", 24), ("Bitrate", 20), ("Description", 1)]
     else:
         columns = [
             ("Codec", 32),
@@ -1908,7 +1907,7 @@ def info_stream_rows(streams: list[dict], stream_type: str) -> list[str]:
         else:
             description = format_subtitle_description(stream)
         if stream_type == "video":
-            lines.append(f"{codec:<32} {bitrate:<15} {description}")
+            lines.append(f"{codec:<24} {bitrate:<20} {description}")
         else:
             lines.append(f"{codec:<32} {language:<16} {bitrate:<15} {description}")
     return lines
@@ -1968,14 +1967,14 @@ def format_info_report(
     streams = add_playlist_languages(playlist, list(media_info.get("streams", [])))
 
     lines = [
-        "DISC INFO",
+        "DISC INFO:",
         "",
         f"Disc Title:     {label}",
         f"Disc Label:     {label}",
         f"Disc Size:      {image.remote.size:,} bytes",
         f"Protection:     {protection}",
         f"Extras:         {extras}",
-        f"Scanner:        remote-bluray {__version__} (ffprobe)",
+        f"BDInfo:         remote-bluray {__version__} (ffprobe)",
         f"Scan:           {scan_label}",
         "",
         "PLAYLIST REPORT:",

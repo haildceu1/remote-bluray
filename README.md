@@ -123,7 +123,7 @@ Playlists: 13 (excluding .mpls.backup)
 
 ## 提取主片编码信息
 
-`info` 使用已有的 `main` 播放列表选择逻辑，生成接近 BDInfo 的报告，包含碟片信息、播放列表、视频、音频、字幕和 M2TS 文件明细：
+`info` 使用已有的 `main` 播放列表选择逻辑，生成标准 BDInfo 风格的报告，包含碟片信息、播放列表、视频、音频、字幕和 M2TS 文件明细。流信息标题后使用独立的 `---` 分隔行，适合直接放入 BBCode 的 `[code]` 区块：
 
 ```powershell
 python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm"

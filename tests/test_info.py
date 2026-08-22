@@ -99,8 +99,10 @@ class InfoTests(TestCase):
 
         report = app.format_info_report(FakeImage(), self.playlist, media_info, "partial")
 
+        self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
+        self.assertIn("BDInfo:         remote-bluray 0.10.0 (ffprobe)", report)
         self.assertIn("First 100 seconds only", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
@@ -109,7 +111,10 @@ class InfoTests(TestCase):
         self.assertIn("FILES:", report)
         self.assertIn("00001.M2TS", report)
         self.assertNotIn("-" * 100, report)
-        self.assertIn("-----                            -------", report)
+        self.assertNotIn("-----                            -------", report)
+        self.assertIn("VIDEO:\n\nCodec", report)
+        self.assertIn("\n\n---\n\nMPEG-4 AVC Video", report)
+        self.assertIn("AUDIO:\n\nCodec", report)
 
     def test_cs0_volume_labels_ignore_fixed_field_padding(self):
         self.assertEqual(
