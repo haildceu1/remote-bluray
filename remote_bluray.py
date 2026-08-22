@@ -10,12 +10,15 @@ from __future__ import annotations
 import argparse
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import importlib.util
 import json
 import os
 import random
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import textwrap
@@ -27,12 +30,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, Iterator
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -2092,8 +2095,7 @@ def command_list(args):
             print(format_playlist_details(playlist, server, stream_cache), flush=True)
 
 
-def command_info(args):
-    image = image_from_args(args)
+def collect_info_result(args, image: RemoteUdfImage, progress_file=None) -> dict:
     playlists = select_playlists(image, None, args.mode, None)
     if len(playlists) != 1:
         raise RuntimeError("info expects exactly one playlist")
@@ -2121,7 +2123,7 @@ def command_info(args):
     with VirtualFileServer(image, verbose=args.verbose) as server:
         with virtual_input(image, server, None, playlist.name) as selected:
             input_args, _label = selected
-            print(f"Scanning {playlist.name} ({scan_label})...", flush=True)
+            print(f"Scanning {playlist.name} ({scan_label})...", file=progress_file, flush=True)
             media_info = probe_media_info(input_args, args.scan, partial_seconds)
             packet_sizes = probe_packet_stats(input_args, args.scan, partial_seconds)
             apply_packet_bitrates(
@@ -2150,25 +2152,204 @@ def command_info(args):
                     )
                 except ValueError as error:
                     raise SystemExit(f"Error: {error}") from error
-    print(
-        format_info_report(image, playlist, media_info, args.scan, partial_seconds),
-        flush=True,
+    return {
+        "playlist": playlist,
+        "report": format_info_report(image, playlist, media_info, args.scan, partial_seconds),
+        "screenshots": screenshot_outputs,
+        "screenshot_subtitle": screenshot_subtitle,
+        "screenshot_skip_start": screenshot_skip_start,
+    }
+
+
+def print_info_result(args, result: dict) -> None:
+    print(result["report"], flush=True)
+    screenshot_outputs = result["screenshots"]
+    if not screenshot_outputs:
+        return
+    screenshot_subtitle = result["screenshot_subtitle"]
+    print("\nSCREENSHOTS:", flush=True)
+    if screenshot_subtitle:
+        print(
+            f"  Subtitle: {screenshot_subtitle[1]} "
+            f"(subtitle stream {screenshot_subtitle[0] + 1})",
+            flush=True,
+        )
+    elif args.screenshot_subtitle == "none":
+        print("  Subtitle: disabled", flush=True)
+    else:
+        print("  Subtitle: no Chinese subtitle found", flush=True)
+    print(f"  Skip start: {result['screenshot_skip_start']:g} seconds", flush=True)
+    for output in screenshot_outputs:
+        print(f"  {output}", flush=True)
+
+
+def command_info(args):
+    image = image_from_args(args)
+    result = collect_info_result(args, image)
+    print_info_result(args, result)
+
+
+def load_tmdb_module(script_path: str | Path):
+    script_path = Path(script_path).expanduser()
+    if not script_path.is_file():
+        raise FileNotFoundError(f"TMDB script not found: {script_path}")
+    module_spec = importlib.util.spec_from_file_location("remote_bluray_tmdb_info", script_path)
+    if module_spec is None or module_spec.loader is None:
+        raise RuntimeError(f"Unable to load TMDB script: {script_path}")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    for name in ("fetch_tmdb_data", "generate_bbcode"):
+        if not callable(getattr(module, name, None)):
+            raise RuntimeError(f"TMDB script must define {name}(): {script_path}")
+    return module
+
+
+def tmdb_api_key(module, configured_key: str | None) -> str:
+    api_key = configured_key or os.environ.get("TMDB_API_KEY")
+    if not api_key:
+        api_key = getattr(module, "DEFAULT_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "No TMDB API key. Use --tmdb-api-key or set TMDB_API_KEY."
+        )
+    return api_key
+
+
+def source_filename(image: RemoteUdfImage) -> str:
+    path = unquote(urlsplit(image.url).path).rstrip("/")
+    filename = path.rsplit("/", 1)[-1]
+    return filename or "remote-bluray.iso"
+
+
+def build_ed2k_link(image: RemoteUdfImage, args) -> str:
+    if args.ed2k_link:
+        return args.ed2k_link.strip()
+    if args.ed2k_hash:
+        return (
+            f"ed2k://|file|{source_filename(image)}|{image.remote.size}|"
+            f"{args.ed2k_hash.strip()}|/"
+        )
+    return "[待补充 ED2K 链接]"
+
+
+def run_git(repo: Path, *git_args: str, check: bool = True) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *git_args],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
-    if screenshot_outputs:
-        print("\nSCREENSHOTS:", flush=True)
-        if screenshot_subtitle:
-            print(
-                f"  Subtitle: {screenshot_subtitle[1]} "
-                f"(subtitle stream {screenshot_subtitle[0] + 1})",
-                flush=True,
-            )
-        elif args.screenshot_subtitle == "none":
-            print("  Subtitle: disabled", flush=True)
-        else:
-            print("  Subtitle: no Chinese subtitle found", flush=True)
-        print(f"  Skip start: {screenshot_skip_start:g} seconds", flush=True)
-        for output in screenshot_outputs:
-            print(f"  {output}", flush=True)
+    if check and completed.returncode:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"git {' '.join(git_args)} failed in {repo}: {detail}")
+    return completed.stdout.strip()
+
+
+def upload_images_to_picx(image_paths: list[Path], repo_path: str | Path) -> list[str]:
+    """Upload generated screenshots to both PicX branches and return GitHub Pages URLs."""
+    if not image_paths:
+        return []
+    repo = Path(repo_path).expanduser().resolve()
+    if not (repo / ".git").exists():
+        raise RuntimeError(f"PicX repository is not a Git checkout: {repo}")
+    if run_git(repo, "status", "--porcelain"):
+        raise RuntimeError(f"PicX repository has local changes; commit or move them first: {repo}")
+
+    destinations: list[tuple[Path, str]] = []
+    for image_path in image_paths:
+        source = Path(image_path)
+        if not source.is_file():
+            raise FileNotFoundError(f"Screenshot not found: {source}")
+        digest = hashlib.sha1(source.read_bytes()).hexdigest()[:10]
+        filename = f"{source.stem}.{digest}{source.suffix.lower()}"
+        destinations.append((source, filename))
+
+    original_branch = run_git(repo, "branch", "--show-current")
+    if not original_branch:
+        raise RuntimeError(f"PicX repository is in a detached HEAD state: {repo}")
+
+    run_git(repo, "fetch", "origin")
+    for branch in ("master", "gh-pages"):
+        if not run_git(repo, "show-ref", "--verify", f"refs/remotes/origin/{branch}", check=False):
+            raise RuntimeError(f"PicX repository has no origin/{branch} branch: {repo}")
+
+    try:
+        for branch in ("master", "gh-pages"):
+            local_branch = run_git(repo, "show-ref", "--verify", f"refs/heads/{branch}", check=False)
+            if local_branch:
+                run_git(repo, "checkout", branch)
+            else:
+                run_git(repo, "checkout", "-b", branch, f"origin/{branch}")
+            run_git(repo, "pull", "--ff-only", "origin", branch)
+
+            names_to_add: list[str] = []
+            for source, filename in destinations:
+                target = repo / filename
+                if target.exists():
+                    if target.read_bytes() != source.read_bytes():
+                        raise RuntimeError(f"PicX filename collision with different content: {target}")
+                else:
+                    shutil.copy2(source, target)
+                    names_to_add.append(filename)
+            if names_to_add:
+                run_git(repo, "add", "--", *names_to_add)
+                if run_git(repo, "diff", "--cached", "--name-only"):
+                    run_git(repo, "commit", "-m", "Upload bdshare screenshots")
+                    run_git(repo, "push", "origin", branch)
+    finally:
+        run_git(repo, "checkout", original_branch)
+
+    return [
+        f"https://haildceu1.github.io/picx-images-hosting/{quote(filename)}"
+        for _source, filename in destinations
+    ]
+
+
+def build_bdshare_post(
+    tmdb_bbcode: str,
+    poster_url: str,
+    info_report: str,
+    screenshot_urls: list[str],
+    ed2k_link: str,
+) -> str:
+    lines = [f"[free][img]{poster_url}[/img]", "", tmdb_bbcode.rstrip(), "", "[code]"]
+    lines.extend(info_report.rstrip().splitlines())
+    lines.extend(["[/code]"])
+    for screenshot_url in screenshot_urls:
+        lines.extend(["", f"[img]{screenshot_url}[/img]"])
+    lines.extend(["[/free]", "", "[hide][code]", ed2k_link, "[/code]", "[/hide]"])
+    return "\n".join(lines)
+
+
+def command_bdshare(args):
+    image = image_from_args(args)
+    tmdb_module = load_tmdb_module(args.tmdb_script)
+    api_key = tmdb_api_key(tmdb_module, args.tmdb_api_key)
+    tmdb_data = tmdb_module.fetch_tmdb_data(args.tmdb_id, args.tmdb_type, api_key)
+    if not isinstance(tmdb_data, dict) or tmdb_data.get("error"):
+        error = tmdb_data.get("error", "TMDB returned no data") if isinstance(tmdb_data, dict) else str(tmdb_data)
+        raise RuntimeError(f"TMDB lookup failed: {error}")
+    poster_url = str(tmdb_data.get("poster_url", "")).strip()
+    if not poster_url:
+        raise RuntimeError("TMDB lookup returned no poster URL")
+
+    result = collect_info_result(args, image, progress_file=sys.stderr)
+    screenshot_urls = upload_images_to_picx(result["screenshots"], args.picx_repo)
+    tmdb_bbcode = tmdb_module.generate_bbcode(tmdb_data)
+    post = build_bdshare_post(
+        tmdb_bbcode,
+        poster_url,
+        result["report"],
+        screenshot_urls,
+        build_ed2k_link(image, args),
+    )
+    if args.output:
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(post + "\n", encoding="utf-8")
+    print(post)
 
 
 def command_probe(args):
@@ -2435,6 +2616,95 @@ def build_parser():
         help="skip this much of the beginning before choosing screenshots, in seconds or H:M:S (default: 60 seconds)",
     )
     info_parser.set_defaults(func=command_info)
+
+    bdshare_parser = subparsers.add_parser(
+        "bdshare",
+        help="generate a complete BDShare BBCode post from TMDB, disc info, and screenshots",
+    )
+    add_remote_options(bdshare_parser, suppress_defaults=True)
+    bdshare_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
+    bdshare_parser.add_argument(
+        "--mode",
+        choices=("main",),
+        default="main",
+        help="playlist selection mode (currently only main is supported)",
+    )
+    bdshare_parser.add_argument(
+        "--scan",
+        choices=("full", "partial"),
+        default="partial",
+        help="scan the complete main playlist or a partial interval (default: partial)",
+    )
+    bdshare_parser.add_argument(
+        "--scan-duration",
+        default="300",
+        help="partial scan duration in seconds or H:M:S (default: 300 seconds)",
+    )
+    bdshare_parser.add_argument("--tmdb-id", required=True, help="TMDB movie or TV ID")
+    bdshare_parser.add_argument(
+        "--tmdb-type",
+        choices=("movie", "tv"),
+        default="movie",
+        help="TMDB item type (default: movie)",
+    )
+    bdshare_parser.add_argument(
+        "--tmdb-script",
+        default=r"D:\Academic\tmdb_info.py",
+        help=r"path to the local TMDB helper script (default: D:\Academic\tmdb_info.py)",
+    )
+    bdshare_parser.add_argument(
+        "--tmdb-api-key",
+        help="TMDB API key; otherwise TMDB_API_KEY or the helper script default is used",
+    )
+    bdshare_parser.add_argument(
+        "--picx-repo",
+        default=str(Path(__file__).resolve().parent / "picx-images-hosting"),
+        metavar="DIR",
+        help="local checkout of picx-images-hosting (default: ./picx-images-hosting)",
+    )
+    bdshare_parser.add_argument(
+        "--screenshots",
+        "--screenshot-count",
+        dest="screenshot_count",
+        type=nonnegative_int,
+        default=3,
+        metavar="N",
+        help="save and upload N random JPEG screenshots (default: 3)",
+    )
+    bdshare_parser.add_argument(
+        "--screenshot-dir",
+        default="bdshare-screenshots",
+        metavar="DIR",
+        help="directory for generated screenshots (default: bdshare-screenshots)",
+    )
+    bdshare_parser.add_argument(
+        "--seed",
+        type=int,
+        help="optional random seed for reproducible screenshot timestamps",
+    )
+    bdshare_parser.add_argument(
+        "--screenshot-subtitle",
+        choices=("auto", "none"),
+        default="auto",
+        help="burn the first Chinese subtitle into screenshots, or disable it (default: auto)",
+    )
+    bdshare_parser.add_argument(
+        "--screenshot-skip-start",
+        default=str(int(DEFAULT_SCREENSHOT_SKIP_START_SECONDS)),
+        help="skip this much of the beginning before choosing screenshots, in seconds or H:M:S (default: 60 seconds)",
+    )
+    ed2k_group = bdshare_parser.add_mutually_exclusive_group()
+    ed2k_group.add_argument("--ed2k-link", help="complete ED2K link to place in the hidden section")
+    ed2k_group.add_argument(
+        "--ed2k-hash",
+        help="ED2K file hash; the filename and remote ISO size are filled automatically",
+    )
+    bdshare_parser.add_argument(
+        "-o",
+        "--output",
+        help="also save the generated BBCode post to a UTF-8 text file",
+    )
+    bdshare_parser.set_defaults(func=command_bdshare)
 
     probe_parser = subparsers.add_parser("probe", help="probe a virtual M2TS or MPLS timeline with ffprobe")
     add_remote_options(probe_parser, suppress_defaults=True)

@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.8.1-py3-none-any.whl
+python -m pip install remote_bluray-0.9.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -156,6 +156,24 @@ python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan part
 不指定 `--scan partial` 时，截图时间范围覆盖完整主播放列表；不指定 `--screenshots` 时不会生成截图。
 
 码率由扫描区间内各流的实际 packet 字节数计算。部分扫描适合先快速确认编码、语言和轨道布局，但码率只代表指定区间样本；如果某条字幕在指定区间没有出现 packet，其码率会显示为 `-`。报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
+
+## 生成 BDShare 发布文稿
+
+`bdshare` 会把 TMDB 资料、海报地址、`info` 碟片编码报告和随机截图组合成一份完整 BBCode 文稿。TMDB 数据通过本机的 `D:\Academic\tmdb_info.py` 获取；该脚本需要提供 `fetch_tmdb_data()`、`generate_bbcode()`，并返回 `poster_url`。可以使用 `--tmdb-api-key`，也可以设置 `TMDB_API_KEY` 环境变量。
+
+运行前需要先把 `picx-images-hosting` 克隆到本机，并确保工作区干净；程序会把截图同步到该仓库的 `master` 和 `gh-pages` 两个分支，再使用 GitHub Pages 地址写入文稿：
+
+```powershell
+python -X utf8 remote_bluray.py bdshare "https://example.com/movie.iso" `
+  --tmdb-id 8016 `
+  --scan partial --scan-duration 00:05:00 `
+  --screenshots 3 --screenshot-skip-start 00:01:00 `
+  --picx-repo "D:\Repositories\picx-images-hosting" `
+  --ed2k-link "ed2k://|file|movie.iso|123456789|ED2K_HASH|/" `
+  --output "D:\output\bdshare-post.txt"
+```
+
+`bdshare` 默认只扫描前 300 秒、生成 3 张截图、跳过片头 60 秒，并自动烧录第一条中文字幕。`--scan full` 可改为完整扫描；`--screenshot-subtitle none` 可关闭字幕烧录。若只提供 `--ed2k-hash`，程序会根据远程 ISO 的文件名和大小生成 ED2K 链接；没有提供 ED2K 参数时会在文稿中保留 `[待补充 ED2K 链接]` 占位符，不会伪造哈希。
 
 ## 按播放列表探测和提取
 

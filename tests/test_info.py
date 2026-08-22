@@ -169,6 +169,43 @@ class InfoTests(TestCase):
 
         self.assertEqual(selected, (1, "Chinese"))
 
+    def test_bdshare_post_contains_tmdb_report_screenshots_and_ed2k(self):
+        post = app.build_bdshare_post(
+            "◎译　　名　德意志零年",
+            "https://image.tmdb.org/t/p/original/poster.jpg",
+            "DISC INFO\n\nVIDEO:\n\nCodec\n-----",
+            ["https://haildceu1.github.io/picx-images-hosting/shot.jpg"],
+            "ed2k://|file|movie.iso|123|HASH|/",
+        )
+
+        self.assertTrue(post.startswith("[free][img]https://image.tmdb.org/t/p/original/poster.jpg[/img]"))
+        self.assertIn("◎译　　名　德意志零年", post)
+        self.assertIn("[code]\nDISC INFO\n\nVIDEO:", post)
+        self.assertIn("[img]https://haildceu1.github.io/picx-images-hosting/shot.jpg[/img]", post)
+        self.assertIn("[hide][code]\ned2k://|file|movie.iso|123|HASH|/\n[/code]", post)
+        self.assertTrue(post.endswith("[/hide]"))
+
+    def test_ed2k_hash_uses_decoded_remote_filename_and_size(self):
+        image = SimpleNamespace(
+            url="https://example.test/d/abc/%E7%94%B5%E5%BD%B1%202024.iso?download=1",
+            remote=SimpleNamespace(size=44942753792),
+        )
+        args = SimpleNamespace(ed2k_link=None, ed2k_hash="ABCDEF")
+
+        self.assertEqual(
+            app.build_ed2k_link(image, args),
+            "ed2k://|file|电影 2024.iso|44942753792|ABCDEF|/",
+        )
+
+    def test_bdshare_parser_has_defaults_for_integrated_workflow(self):
+        args = app.build_parser().parse_args(["bdshare", "source.iso", "--tmdb-id", "8016"])
+
+        self.assertEqual(args.scan, "partial")
+        self.assertEqual(args.scan_duration, "300")
+        self.assertEqual(args.screenshot_count, 3)
+        self.assertEqual(args.tmdb_type, "movie")
+        self.assertEqual(args.screenshot_subtitle, "auto")
+
 
 if __name__ == "__main__":
     import unittest
