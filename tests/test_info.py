@@ -50,6 +50,20 @@ class InfoTests(TestCase):
 
         self.assertEqual(app.format_bitrate_value(media_info["streams"][0]["bit_rate"]), "80 kbps")
 
+    def test_partial_probe_accepts_custom_duration(self):
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"streams": [], "format": {}}),
+            stderr="",
+        )
+        with patch.object(app, "get_executable", return_value="ffprobe"), patch.object(
+            app.subprocess, "run", return_value=completed
+        ) as run:
+            app.probe_media_info(["-i", "virtual.m2ts"], "partial", 300)
+
+        command = run.call_args.args[0]
+        self.assertIn("%+300", command)
+
     def test_report_contains_bdinfo_style_stream_sections(self):
         media_info = {
             "streams": [

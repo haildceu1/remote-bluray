@@ -31,7 +31,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -1306,6 +1306,7 @@ INFO_PARTIAL_SECONDS = 100.0
 def probe_media_info(
     input_args: list[str],
     scan_mode: str = "full",
+    partial_seconds: float = INFO_PARTIAL_SECONDS,
 ) -> dict:
     """Probe a playlist timeline for the detailed ``info`` report.
 
@@ -1323,7 +1324,9 @@ def probe_media_info(
         "json",
     ]
     if scan_mode == "partial":
-        command.extend(["-read_intervals", f"%+{INFO_PARTIAL_SECONDS:g}"])
+        if partial_seconds <= 0:
+            raise ValueError("partial scan duration must be greater than zero")
+        command.extend(["-read_intervals", f"%+{partial_seconds:g}"])
     elif scan_mode != "full":
         raise ValueError(f"Unknown info scan mode: {scan_mode}")
     command.extend(input_args)
@@ -1348,6 +1351,7 @@ def probe_media_info(
 def probe_packet_stats(
     input_args: list[str],
     scan_mode: str = "full",
+    partial_seconds: float = INFO_PARTIAL_SECONDS,
 ) -> dict[int, int]:
     """Sum demuxed packet bytes by stream without buffering full output.
 
@@ -1367,7 +1371,9 @@ def probe_packet_stats(
         "compact=p=1:nk=0",
     ]
     if scan_mode == "partial":
-        command.extend(["-read_intervals", f"%+{INFO_PARTIAL_SECONDS:g}"])
+        if partial_seconds <= 0:
+            raise ValueError("partial scan duration must be greater than zero")
+        command.extend(["-read_intervals", f"%+{partial_seconds:g}"])
     elif scan_mode != "full":
         raise ValueError(f"Unknown info scan mode: {scan_mode}")
     command.extend(input_args)
@@ -1517,12 +1523,13 @@ def apply_packet_bitrates(
     packet_sizes: dict[int, int],
     duration_seconds: float,
     scan_mode: str,
+    partial_seconds: float = INFO_PARTIAL_SECONDS,
 ) -> dict:
     """Add measured average bitrates to the ffprobe stream dictionaries."""
     if duration_seconds <= 0:
         return media_info
     measured_duration = (
-        min(INFO_PARTIAL_SECONDS, duration_seconds)
+        min(partial_seconds, duration_seconds)
         if scan_mode == "partial"
         else duration_seconds
     )
@@ -1788,6 +1795,7 @@ def format_info_report(
     playlist: Playlist,
     media_info: dict,
     scan_mode: str,
+    partial_seconds: float = INFO_PARTIAL_SECONDS,
 ) -> str:
     label = (image.volume_id or "-").strip() or "-"
     protection = "AACS" if udf_path_exists(image, "/AACS") else "None detected"
@@ -1798,7 +1806,7 @@ def format_info_report(
     scan_label = (
         "Complete file"
         if scan_mode == "full"
-        else f"First {int(INFO_PARTIAL_SECONDS)} seconds only"
+        else f"First {partial_seconds:g} seconds only"
     )
     streams = add_playlist_languages(playlist, list(media_info.get("streams", [])))
 
@@ -1919,25 +1927,34 @@ def command_info(args):
     if len(playlists) != 1:
         raise RuntimeError("info expects exactly one playlist")
     playlist = playlists[0]
+    partial_seconds = INFO_PARTIAL_SECONDS
+    if args.scan == "partial":
+        partial_seconds = parse_duration(args.scan_duration)
+        if partial_seconds <= 0:
+            raise ValueError("partial scan duration must be greater than zero")
     scan_label = (
         "complete main playlist"
         if args.scan == "full"
-        else f"first {int(INFO_PARTIAL_SECONDS)} seconds of the main playlist"
+        else f"first {partial_seconds:g} seconds of the main playlist"
     )
 
     with VirtualFileServer(image, verbose=args.verbose) as server:
         with virtual_input(image, server, None, playlist.name) as selected:
             input_args, _label = selected
             print(f"Scanning {playlist.name} ({scan_label})...", flush=True)
-            media_info = probe_media_info(input_args, args.scan)
-            packet_sizes = probe_packet_stats(input_args, args.scan)
+            media_info = probe_media_info(input_args, args.scan, partial_seconds)
+            packet_sizes = probe_packet_stats(input_args, args.scan, partial_seconds)
             apply_packet_bitrates(
                 media_info,
                 packet_sizes,
                 playlist.duration_seconds,
                 args.scan,
+                partial_seconds,
             )
-    print(format_info_report(image, playlist, media_info, args.scan), flush=True)
+    print(
+        format_info_report(image, playlist, media_info, args.scan, partial_seconds),
+        flush=True,
+    )
 
 
 def command_probe(args):
@@ -2165,7 +2182,12 @@ def build_parser():
         "--scan",
         choices=("full", "partial"),
         default="full",
-        help="scan the complete main playlist or only its first 100 seconds (default: full)",
+        help="scan the complete main playlist or a partial interval (default: full)",
+    )
+    info_parser.add_argument(
+        "--scan-duration",
+        default=str(int(INFO_PARTIAL_SECONDS)),
+        help="partial scan duration in seconds or H:M:S (default: 100 seconds)",
     )
     info_parser.set_defaults(func=command_info)
 

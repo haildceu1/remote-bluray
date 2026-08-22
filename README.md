@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.5.1-py3-none-any.whl
+python -m pip install remote_bluray-0.5.2-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -129,13 +129,19 @@ Playlists: 13 (excluding .mpls.backup)
 python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm"
 ```
 
-默认 `--scan full` 会扫描主播放列表的完整时间线；远程原盘较大时可以使用 `--scan partial`，只读取前 100 秒：
+默认 `--scan full` 会扫描主播放列表的完整时间线；远程原盘较大时可以使用 `--scan partial`。partial 默认读取前 100 秒，也可以用 `--scan-duration` 指定秒数或 `H:M:S`：
 
 ```powershell
 python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial
 ```
 
-码率由扫描区间内各流的实际 packet 字节数计算。部分扫描适合先快速确认编码、语言和轨道布局，但码率只代表前 100 秒样本；如果某条字幕在前 100 秒没有出现 packet，其码率会显示为 `-`。报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
+例如只扫描前 5 分钟：
+
+```powershell
+python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial --scan-duration 00:05:00
+```
+
+码率由扫描区间内各流的实际 packet 字节数计算。部分扫描适合先快速确认编码、语言和轨道布局，但码率只代表指定区间样本；如果某条字幕在指定区间没有出现 packet，其码率会显示为 `-`。报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
 
 ## 按播放列表探测和提取
 
