@@ -197,6 +197,32 @@ class InfoTests(TestCase):
             "ed2k://|file|电影 2024.iso|44942753792|ABCDEF|/",
         )
 
+    def test_md4_and_small_ed2k_hash_match_known_vectors(self):
+        self.assertEqual(
+            app.md4_digest(b"").hex(),
+            "31d6cfe0d16ae931b73c59d7e0c089c0",
+        )
+        self.assertEqual(
+            app.md4_digest(b"a").hex(),
+            "bde52cb31de33e46245e05fbdbd6fb24",
+        )
+
+    def test_calculate_ed2k_hash_streams_remote_bytes(self):
+        payload = b"abc"
+        remote = SimpleNamespace(
+            size=len(payload),
+            read_range=lambda offset, size: payload[offset : offset + size],
+        )
+
+        self.assertEqual(
+            app.calculate_ed2k_hash(SimpleNamespace(remote=remote)),
+            app.md4_digest(payload).hex(),
+        )
+        self.assertEqual(
+            app.ed2k_hash_from_parts([app.md4_digest(b"a")], 1),
+            "bde52cb31de33e46245e05fbdbd6fb24",
+        )
+
     def test_bdshare_parser_has_defaults_for_integrated_workflow(self):
         args = app.build_parser().parse_args(["bdshare", "source.iso", "--tmdb-id", "8016"])
 
@@ -205,6 +231,11 @@ class InfoTests(TestCase):
         self.assertEqual(args.screenshot_count, 3)
         self.assertEqual(args.tmdb_type, "movie")
         self.assertEqual(args.screenshot_subtitle, "auto")
+
+        auto_args = app.build_parser().parse_args(
+            ["bdshare", "source.iso", "--tmdb-id", "8016", "--ed2k-auto"]
+        )
+        self.assertTrue(auto_args.ed2k_auto)
 
 
 if __name__ == "__main__":

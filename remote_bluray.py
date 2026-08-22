@@ -35,12 +35,86 @@ from urllib.parse import quote, unquote, urlsplit
 import requests
 
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 BLOCK_SIZE = 2048
+ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
 DEFAULT_PREFETCH = 2
 MAX_RETRIES = 4
+
+
+def md4_digest(data: bytes) -> bytes:
+    """Return an MD4 digest without requiring an optional crypto package."""
+    message = bytearray(data)
+    bit_length = len(message) * 8
+    message.append(0x80)
+    message.extend(b"\x00" * ((56 - len(message) % 64) % 64))
+    message.extend(struct.pack("<Q", bit_length))
+
+    def rotate(value: int, amount: int) -> int:
+        return ((value << amount) | (value >> (32 - amount))) & 0xFFFFFFFF
+
+    def round_one(x: int, y: int, z: int) -> int:
+        return (x & y) | (~x & z)
+
+    def round_two(x: int, y: int, z: int) -> int:
+        return (x & y) | (x & z) | (y & z)
+
+    def round_three(x: int, y: int, z: int) -> int:
+        return x ^ y ^ z
+
+    a0, b0, c0, d0 = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476
+    for offset in range(0, len(message), 64):
+        words = struct.unpack_from("<16I", message, offset)
+        a, b, c, d = a0, b0, c0, d0
+        for function, indexes, shifts, constant in (
+            (round_one, range(16), (3, 7, 11, 19), 0),
+            (round_two, (0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15), (3, 5, 9, 13), 0x5A827999),
+            (round_three, (0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15), (3, 9, 11, 15), 0x6ED9EBA1),
+        ):
+            for index, word_index in enumerate(indexes):
+                value = (a + function(b, c, d) + words[word_index] + constant) & 0xFFFFFFFF
+                a = rotate(value, shifts[index % 4])
+                a, b, c, d = d, a, b, c
+        a0 = (a0 + a) & 0xFFFFFFFF
+        b0 = (b0 + b) & 0xFFFFFFFF
+        c0 = (c0 + c) & 0xFFFFFFFF
+        d0 = (d0 + d) & 0xFFFFFFFF
+    return struct.pack("<4I", a0, b0, c0, d0)
+
+
+def ed2k_hash_from_parts(part_hashes: list[bytes], total_size: int) -> str:
+    if total_size <= ED2K_PART_SIZE:
+        digest = part_hashes[0] if part_hashes else md4_digest(b"")
+    else:
+        digest = md4_digest(b"".join(part_hashes))
+    return digest.hex()
+
+
+def calculate_ed2k_hash(image: RemoteUdfImage, progress_file=None) -> str:
+    """Calculate the ED2K hash by streaming the complete remote file."""
+    part_hashes: list[bytes] = []
+    offset = 0
+    total_size = image.remote.size
+    while offset < total_size:
+        part_size = min(ED2K_PART_SIZE, total_size - offset)
+        data = image.remote.read_range(offset, part_size)
+        if len(data) != part_size:
+            raise IOError(
+                f"Short read while calculating ED2K hash at {offset}: "
+                f"{len(data)} bytes, expected {part_size}"
+            )
+        part_hashes.append(md4_digest(data))
+        offset += part_size
+        if progress_file is not None:
+            print(
+                f"ED2K: hashed {offset:,}/{total_size:,} bytes "
+                f"({offset / total_size:.1%})",
+                file=progress_file,
+                flush=True,
+            )
+    return ed2k_hash_from_parts(part_hashes, total_size)
 
 
 def u16(data: bytes, offset: int) -> int:
@@ -1981,16 +2055,18 @@ def save_random_screenshots(
             "-loglevel",
             "error",
             "-nostdin",
-            "-ss",
-            f"{seconds:.3f}",
         ] + input_args
+        # Seek after opening the virtual concat input.  Input seeking can land
+        # on a non-IDR HEVC frame, which produces block corruption on UHD/DV
+        # playlists streamed through the local HTTP server.
+        command.extend(["-ss", f"{seconds:.3f}"])
         if subtitle_index is None:
-            command.extend(["-map", "0:v:0"])
+            command.extend(["-map", "0:v:0", "-vf", "format=yuv420p"])
         else:
             command.extend(
                 [
                     "-filter_complex",
-                    f"[0:v:0][0:s:{subtitle_index}]overlay=shortest=1[v]",
+                    f"[0:v:0][0:s:{subtitle_index}]overlay=shortest=1,format=yuv420p[v]",
                     "-map",
                     "[v]",
                 ]
@@ -2221,13 +2297,18 @@ def source_filename(image: RemoteUdfImage) -> str:
     return filename or "remote-bluray.iso"
 
 
-def build_ed2k_link(image: RemoteUdfImage, args) -> str:
+def build_ed2k_link(image: RemoteUdfImage, args, progress_file=None) -> str:
     if args.ed2k_link:
         return args.ed2k_link.strip()
     if args.ed2k_hash:
         return (
             f"ed2k://|file|{source_filename(image)}|{image.remote.size}|"
             f"{args.ed2k_hash.strip()}|/"
+        )
+    if getattr(args, "ed2k_auto", False):
+        return (
+            f"ed2k://|file|{source_filename(image)}|{image.remote.size}|"
+            f"{calculate_ed2k_hash(image, progress_file)}|/"
         )
     return "[待补充 ED2K 链接]"
 
@@ -2343,7 +2424,7 @@ def command_bdshare(args):
         poster_url,
         result["report"],
         screenshot_urls,
-        build_ed2k_link(image, args),
+        build_ed2k_link(image, args, progress_file=sys.stderr),
     )
     if args.output:
         output = Path(args.output).expanduser()
@@ -2698,6 +2779,11 @@ def build_parser():
     ed2k_group.add_argument(
         "--ed2k-hash",
         help="ED2K file hash; the filename and remote ISO size are filled automatically",
+    )
+    ed2k_group.add_argument(
+        "--ed2k-auto",
+        action="store_true",
+        help="read the complete remote ISO and calculate its real ED2K hash",
     )
     bdshare_parser.add_argument(
         "-o",
