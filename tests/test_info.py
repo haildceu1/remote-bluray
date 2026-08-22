@@ -108,6 +108,8 @@ class InfoTests(TestCase):
         self.assertIn("28.636 kbps", report)
         self.assertIn("FILES:", report)
         self.assertIn("00001.M2TS", report)
+        self.assertNotIn("-" * 100, report)
+        self.assertIn("-----                            -------", report)
 
     def test_cs0_volume_labels_ignore_fixed_field_padding(self):
         self.assertEqual(
@@ -138,13 +140,27 @@ class InfoTests(TestCase):
                 "shots",
                 "--seed",
                 "1948",
+                "--screenshot-subtitle",
+                "none",
             ]
         )
 
         self.assertEqual(args.screenshot_count, 3)
         self.assertEqual(args.screenshot_dir, "shots")
         self.assertEqual(args.seed, 1948)
+        self.assertEqual(args.screenshot_subtitle, "none")
         self.assertEqual(app.parse_duration(args.scan_duration), 300)
+
+    def test_chooses_first_chinese_subtitle_stream(self):
+        streams = [
+            {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle", "tags": {"language": "eng"}},
+            {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle", "tags": {"language": "chi"}},
+            {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle", "tags": {"language": "zho"}},
+        ]
+
+        selected = app.choose_chinese_subtitle_stream(self.playlist, streams, "auto")
+
+        self.assertEqual(selected, (1, "Chinese"))
 
 
 if __name__ == "__main__":

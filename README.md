@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.6.0-py3-none-any.whl
+python -m pip install remote_bluray-0.7.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -146,6 +146,8 @@ python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan part
 ```powershell
 python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan partial --scan-duration 00:05:00 --screenshots 5 --screenshot-dir "D:\output\screenshots" --seed 1948
 ```
+
+截图默认会自动烧录主播放列表中的第一条中文字幕（包括 PGS 位图字幕）；使用 `--screenshot-subtitle none` 可以关闭字幕烧录。报告会标记实际使用的字幕流。
 
 不指定 `--scan partial` 时，截图时间范围覆盖完整主播放列表；不指定 `--screenshots` 时不会生成截图。
 

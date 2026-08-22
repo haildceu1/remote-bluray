@@ -32,7 +32,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 BLOCK_SIZE = 2048
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
@@ -1432,6 +1432,17 @@ LANGUAGE_NAMES = {
     "rus": "Russian",
 }
 
+CHINESE_LANGUAGE_CODES = {
+    "chi",
+    "zho",
+    "cmn",
+    "zh",
+    "cn",
+    "chs",
+    "cht",
+    "chinese",
+}
+
 
 def display_language(value: str | None) -> str:
     if not value:
@@ -1734,12 +1745,26 @@ def playlist_stream_metadata(
     return merged
 
 
+def info_table_header(columns: list[tuple[str, int]]) -> list[str]:
+    header = " ".join(f"{name:<{width}}" for name, width in columns).rstrip()
+    divider = " ".join(
+        f"{'-' * len(name):<{width}}" for name, width in columns
+    ).rstrip()
+    return [header, divider]
+
+
 def info_stream_rows(streams: list[dict], stream_type: str) -> list[str]:
     selected = [stream for stream in streams if stream.get("codec_type") == stream_type]
-    lines = [
-        f"{'Codec':<32} {'Language':<16} {'Bitrate':<15} Description",
-        "-" * 100,
-    ]
+    if stream_type == "video":
+        columns = [("Codec", 32), ("Bitrate", 15), ("Description", 1)]
+    else:
+        columns = [
+            ("Codec", 32),
+            ("Language", 16),
+            ("Bitrate", 15),
+            ("Description", 1),
+        ]
+    lines = info_table_header(columns)
     if not selected:
         lines.append("(none)")
         return lines
@@ -1754,7 +1779,10 @@ def info_stream_rows(streams: list[dict], stream_type: str) -> list[str]:
             description = format_audio_description(stream)
         else:
             description = format_subtitle_description(stream)
-        lines.append(f"{codec:<32} {language:<16} {bitrate:<15} {description}")
+        if stream_type == "video":
+            lines.append(f"{codec:<32} {bitrate:<15} {description}")
+        else:
+            lines.append(f"{codec:<32} {language:<16} {bitrate:<15} {description}")
     return lines
 
 
@@ -1842,12 +1870,45 @@ def format_info_report(
             "",
             "FILES:",
             "",
-            f"{'Name':<16} {'Time In':<21} {'Length':<16} {'Size':>20} {'Total Bitrate':>14}",
-            "-" * 100,
         ]
+    )
+    lines.extend(
+        info_table_header(
+            [
+                ("Name", 16),
+                ("Time In", 21),
+                ("Length", 16),
+                ("Size", 20),
+                ("Total Bitrate", 14),
+            ]
+        )
     )
     lines.extend(playlist_file_rows(image, playlist))
     return "\n".join(lines)
+
+
+def choose_chinese_subtitle_stream(
+    playlist: Playlist,
+    streams: list[dict],
+    mode: str,
+) -> tuple[int, str] | None:
+    """Return the first Chinese subtitle's type-relative stream index."""
+    if mode == "none":
+        return None
+    if mode != "auto":
+        raise ValueError(f"Unknown screenshot subtitle mode: {mode}")
+
+    enriched_streams = add_playlist_languages(playlist, streams)
+    subtitle_index = 0
+    for stream in enriched_streams:
+        if stream.get("codec_type") != "subtitle":
+            continue
+        language = stream_language(stream)
+        normalized = str(language or "").strip().casefold()
+        if normalized in CHINESE_LANGUAGE_CODES or display_language(language) == "Chinese":
+            return subtitle_index, display_language(language)
+        subtitle_index += 1
+    return None
 
 
 def random_screenshot_times(
@@ -1885,6 +1946,7 @@ def save_random_screenshots(
     count: int,
     output_directory: str | Path,
     seed: int | None = None,
+    subtitle_index: int | None = None,
 ) -> list[Path]:
     """Save random JPEG frames from the already-built virtual playlist input."""
     times = random_screenshot_times(duration_seconds, count, seed)
@@ -1907,16 +1969,27 @@ def save_random_screenshots(
             "-nostdin",
             "-ss",
             f"{seconds:.3f}",
-        ] + input_args + [
-            "-map",
-            "0:v:0",
+        ] + input_args
+        if subtitle_index is None:
+            command.extend(["-map", "0:v:0"])
+        else:
+            command.extend(
+                [
+                    "-filter_complex",
+                    f"[0:v:0][0:s:{subtitle_index}]overlay=shortest=1[v]",
+                    "-map",
+                    "[v]",
+                ]
+            )
+        command.extend([
+            "-an",
             "-frames:v",
             "1",
             "-q:v",
             "2",
             "-y",
             str(output),
-        ]
+        ])
         result = subprocess.run(
             command,
             check=False,
@@ -2044,6 +2117,11 @@ def command_info(args):
                 args.scan,
                 partial_seconds,
             )
+            screenshot_subtitle = choose_chinese_subtitle_stream(
+                playlist,
+                list(media_info.get("streams", [])),
+                args.screenshot_subtitle,
+            )
             if args.screenshot_count:
                 screenshot_outputs = save_random_screenshots(
                     input_args,
@@ -2052,6 +2130,7 @@ def command_info(args):
                     args.screenshot_count,
                     args.screenshot_dir,
                     args.seed,
+                    screenshot_subtitle[0] if screenshot_subtitle else None,
                 )
     print(
         format_info_report(image, playlist, media_info, args.scan, partial_seconds),
@@ -2059,6 +2138,16 @@ def command_info(args):
     )
     if screenshot_outputs:
         print("\nSCREENSHOTS:", flush=True)
+        if screenshot_subtitle:
+            print(
+                f"  Subtitle: {screenshot_subtitle[1]} "
+                f"(subtitle stream {screenshot_subtitle[0] + 1})",
+                flush=True,
+            )
+        elif args.screenshot_subtitle == "none":
+            print("  Subtitle: disabled", flush=True)
+        else:
+            print("  Subtitle: no Chinese subtitle found", flush=True)
         for output in screenshot_outputs:
             print(f"  {output}", flush=True)
 
@@ -2314,6 +2403,12 @@ def build_parser():
         "--seed",
         type=int,
         help="optional random seed for reproducible screenshot timestamps",
+    )
+    info_parser.add_argument(
+        "--screenshot-subtitle",
+        choices=("auto", "none"),
+        default="auto",
+        help="burn the first Chinese subtitle into screenshots, or disable it (default: auto)",
     )
     info_parser.set_defaults(func=command_info)
 
