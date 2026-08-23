@@ -34,8 +34,13 @@ from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
+try:
+    from Crypto.Hash import MD4 as _CryptoMD4
+except ImportError:  # pragma: no cover - exercised on minimal installations
+    _CryptoMD4 = None
 
-__version__ = "0.10.0"
+
+__version__ = "0.10.1"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
@@ -45,7 +50,12 @@ MAX_RETRIES = 4
 
 
 def md4_digest(data: bytes) -> bytes:
-    """Return an MD4 digest without requiring an optional crypto package."""
+    """Return an MD4 digest, using PyCryptodome when available."""
+    if _CryptoMD4 is not None:
+        return _CryptoMD4.new(data=data).digest()
+
+    # Keep a dependency-free fallback for direct source usage.  The packaged
+    # application installs PyCryptodome so ED2K hashing is not CPU-bound here.
     message = bytearray(data)
     bit_length = len(message) * 8
     message.append(0x80)
