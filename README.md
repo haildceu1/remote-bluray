@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.10.2-py3-none-any.whl
+python -m pip install remote_bluray-0.10.3-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -175,7 +175,7 @@ python -X utf8 remote_bluray.py bdshare "https://example.com/movie.iso" `
 
 `bdshare` 默认只扫描前 300 秒、生成 3 张截图、跳过片头 60 秒，并自动烧录第一条中文字幕。`--scan full` 可改为完整扫描；`--screenshot-subtitle none` 可关闭字幕烧录。若只提供 `--ed2k-hash`，程序会根据远程 ISO 的文件名和大小生成 ED2K 链接；没有提供 ED2K 参数时会在文稿中保留 `[待补充 ED2K 链接]` 占位符。
 
-ED2K 哈希不能由 URL、文件名或文件大小直接推导，必须读取完整文件内容。`--ed2k-auto` 会以 ED2K 标准分块并行读取整个远程 ISO，在内存中计算真实哈希，不会额外保存 ISO；程序会优先使用 PyCryptodome 的高速 MD4 实现，避免纯 Python 哈希成为瓶颈。默认使用 4 个小 Range 并发请求，`--ed2k-workers` 可调整并发数；网络流量仍约等于完整 ISO 大小，建议在网络稳定且确实需要真实 ED2K 时使用：
+ED2K 哈希不能由 URL、文件名或文件大小直接推导，必须读取完整文件内容。`--ed2k-auto` 会以 ED2K 标准分块并行读取整个远程 ISO，在内存中计算真实哈希，不会额外保存 ISO；程序会优先使用 PyCryptodome 的高速 MD4 实现，避免纯 Python 哈希成为瓶颈。默认使用 2 个小 Range 并发请求，`--ed2k-workers` 可调整并发数；若远端返回 403，应降低并发数。网络流量仍约等于完整 ISO 大小，建议在网络稳定且确实需要真实 ED2K 时使用：
 
 ```powershell
 remote-bluray bdshare "https://example.com/movie.iso" --tmdb-id 241848 --ed2k-auto

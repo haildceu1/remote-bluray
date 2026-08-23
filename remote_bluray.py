@@ -40,13 +40,13 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.10.2"
+__version__ = "0.10.3"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
 DEFAULT_PREFETCH = 2
-DEFAULT_ED2K_WORKERS = 4
+DEFAULT_ED2K_WORKERS = 2
 MAX_RETRIES = 4
 
 
@@ -614,6 +614,7 @@ class RemoteRangeReader:
             raise ValueError(f"range_size must be a multiple of {BLOCK_SIZE} bytes")
 
         self.verbose = verbose
+        self.url = url
         self.workers = workers
         self.prefetch = prefetch
         self.range_size = range_size
@@ -685,9 +686,14 @@ class RemoteRangeReader:
         for attempt in range(MAX_RETRIES + 1):
             response = None
             try:
+                # Alist/115 may issue a redirect URL signed for the specific
+                # Range selected by the request.  Re-enter through the source
+                # URL for every chunk instead of reusing the initial signed
+                # URL, which can otherwise return intermittent 403 errors.
                 response = session.get(
-                    self.final_url,
+                    self.url,
                     headers={"Range": f"bytes={start}-{end}"},
+                    allow_redirects=True,
                     timeout=60,
                 )
                 if response.status_code == 206:
@@ -810,8 +816,9 @@ class RemoteRangeReader:
         """Stream the complete remote object through one full-range request."""
         session = self._session_for_thread()
         response = session.get(
-            self.final_url,
+            self.url,
             headers={"Range": f"bytes=0-{self.size - 1}"},
+            allow_redirects=True,
             stream=True,
             timeout=60,
         )

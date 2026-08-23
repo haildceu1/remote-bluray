@@ -102,7 +102,7 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.10.2 (ffprobe)", report)
+        self.assertIn("BDInfo:         remote-bluray 0.10.3 (ffprobe)", report)
         self.assertIn("First 100 seconds only", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
@@ -257,7 +257,7 @@ class InfoTests(TestCase):
         self.assertEqual(args.scan, "partial")
         self.assertEqual(args.scan_duration, "300")
         self.assertEqual(args.screenshot_count, 3)
-        self.assertEqual(args.ed2k_workers, 4)
+        self.assertEqual(args.ed2k_workers, 2)
         self.assertEqual(args.tmdb_type, "movie")
         self.assertEqual(args.screenshot_subtitle, "auto")
 
