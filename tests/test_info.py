@@ -102,7 +102,7 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.10.1 (ffprobe)", report)
+        self.assertIn("BDInfo:         remote-bluray 0.10.2 (ffprobe)", report)
         self.assertIn("First 100 seconds only", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
@@ -237,12 +237,27 @@ class InfoTests(TestCase):
             "bde52cb31de33e46245e05fbdbd6fb24",
         )
 
+    def test_calculate_ed2k_hash_uses_parallel_complete_file_ranges(self):
+        payload = b"abcdefghij"
+        remote = SimpleNamespace(
+            size=len(payload),
+            fetch_range=lambda offset, size: payload[offset : offset + size],
+        )
+        with patch.object(app, "ED2K_PART_SIZE", 3):
+            expected = app.ed2k_hash_from_parts(
+                [app.md4_digest(payload[index : index + 3]) for index in (0, 3, 6, 9)],
+                len(payload),
+            )
+            actual = app.calculate_ed2k_hash(SimpleNamespace(remote=remote), workers=3)
+        self.assertEqual(actual, expected)
+
     def test_bdshare_parser_has_defaults_for_integrated_workflow(self):
         args = app.build_parser().parse_args(["bdshare", "source.iso", "--tmdb-id", "8016"])
 
         self.assertEqual(args.scan, "partial")
         self.assertEqual(args.scan_duration, "300")
         self.assertEqual(args.screenshot_count, 3)
+        self.assertEqual(args.ed2k_workers, 4)
         self.assertEqual(args.tmdb_type, "movie")
         self.assertEqual(args.screenshot_subtitle, "auto")
 

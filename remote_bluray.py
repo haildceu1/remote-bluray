@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import importlib.util
 import json
@@ -40,12 +40,13 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 2
 DEFAULT_PREFETCH = 2
+DEFAULT_ED2K_WORKERS = 4
 MAX_RETRIES = 4
 
 
@@ -102,46 +103,96 @@ def ed2k_hash_from_parts(part_hashes: list[bytes], total_size: int) -> str:
     return digest.hex()
 
 
-def calculate_ed2k_hash(image: RemoteUdfImage, progress_file=None) -> str:
-    """Calculate the ED2K hash by streaming the complete remote file."""
+def calculate_ed2k_hash(
+    image: RemoteUdfImage,
+    progress_file=None,
+    workers: int = DEFAULT_ED2K_WORKERS,
+) -> str:
+    """Calculate the ED2K hash by reading complete-file parts in parallel."""
+    if workers < 1:
+        raise ValueError("ED2K workers must be at least 1")
+
     part_hashes: list[bytes] = []
-    offset = 0
     total_size = image.remote.size
-    stream_all = getattr(image.remote, "iter_all", None)
-    data_iterator = iter(stream_all(ED2K_PART_SIZE)) if callable(stream_all) else None
-    while offset < total_size:
-        part_size = min(ED2K_PART_SIZE, total_size - offset)
-        if data_iterator is None:
-            data = image.remote.read_range(offset, part_size)
-        else:
-            try:
-                data = next(data_iterator)
-            except StopIteration as error:
+    direct_fetch = getattr(image.remote, "fetch_range", None)
+    if callable(direct_fetch):
+        total_parts = (total_size + ED2K_PART_SIZE - 1) // ED2K_PART_SIZE
+        part_hashes = [b""] * total_parts
+        pending = {}
+        next_index = 0
+        hashed_bytes = 0
+
+        def submit_part(executor, index: int) -> None:
+            offset = index * ED2K_PART_SIZE
+            part_size = min(ED2K_PART_SIZE, total_size - offset)
+            future = executor.submit(direct_fetch, offset, part_size)
+            pending[future] = (index, offset, part_size)
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ed2k") as executor:
+            while next_index < min(total_parts, workers):
+                submit_part(executor, next_index)
+                next_index += 1
+            while pending:
+                done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                for future in done:
+                    index, offset, part_size = pending.pop(future)
+                    data = future.result()
+                    if len(data) != part_size:
+                        raise IOError(
+                            f"Short read while calculating ED2K hash at {offset}: "
+                            f"{len(data)} bytes, expected {part_size}"
+                        )
+                    part_hashes[index] = md4_digest(data)
+                    hashed_bytes += part_size
+                    if progress_file is not None:
+                        print(
+                            f"ED2K: hashed {hashed_bytes:,}/{total_size:,} bytes "
+                            f"({hashed_bytes / total_size:.1%})",
+                            file=progress_file,
+                            flush=True,
+                        )
+                    if next_index < total_parts:
+                        submit_part(executor, next_index)
+                        next_index += 1
+    else:
+        # Compatibility fallback for test doubles and older RemoteRangeReader
+        # implementations that expose only read_range/iter_all.
+        offset = 0
+        stream_all = getattr(image.remote, "iter_all", None)
+        data_iterator = iter(stream_all(ED2K_PART_SIZE)) if callable(stream_all) else None
+        while offset < total_size:
+            part_size = min(ED2K_PART_SIZE, total_size - offset)
+            if data_iterator is None:
+                data = image.remote.read_range(offset, part_size)
+            else:
+                try:
+                    data = next(data_iterator)
+                except StopIteration as error:
+                    raise IOError(
+                        f"Short read while calculating ED2K hash at {offset}: "
+                        f"expected {part_size} more bytes"
+                    ) from error
+            if len(data) != part_size:
                 raise IOError(
                     f"Short read while calculating ED2K hash at {offset}: "
-                    f"expected {part_size} more bytes"
-                ) from error
-        if len(data) != part_size:
-            raise IOError(
-                f"Short read while calculating ED2K hash at {offset}: "
-                f"{len(data)} bytes, expected {part_size}"
-            )
-        part_hashes.append(md4_digest(data))
-        offset += part_size
-        if progress_file is not None:
-            print(
-                f"ED2K: hashed {offset:,}/{total_size:,} bytes "
-                f"({offset / total_size:.1%})",
-                file=progress_file,
-                flush=True,
-            )
-    if total_size == 0 and data_iterator is not None:
-        try:
-            next(data_iterator)
-        except StopIteration:
-            pass
-        else:
-            raise IOError("Remote stream returned data for an empty file")
+                    f"{len(data)} bytes, expected {part_size}"
+                )
+            part_hashes.append(md4_digest(data))
+            offset += part_size
+            if progress_file is not None:
+                print(
+                    f"ED2K: hashed {offset:,}/{total_size:,} bytes "
+                    f"({offset / total_size:.1%})",
+                    file=progress_file,
+                    flush=True,
+                )
+        if total_size == 0 and data_iterator is not None:
+            try:
+                next(data_iterator)
+            except StopIteration:
+                pass
+            else:
+                raise IOError("Remote stream returned data for an empty file")
     return ed2k_hash_from_parts(part_hashes, total_size)
 
 
@@ -746,6 +797,14 @@ class RemoteRangeReader:
             start += count
             self._schedule_prefetch(index)
         return bytes(output)
+
+    def fetch_range(self, start: int, size: int) -> bytes:
+        """Fetch one uncached HTTP Range, for independent parallel readers."""
+        if size <= 0 or start >= self.size:
+            return b""
+        start = max(0, start)
+        end = min(start + size, self.size) - 1
+        return self._fetch(start, end)
 
     def iter_all(self, chunk_size: int) -> Iterator[bytes]:
         """Stream the complete remote object through one full-range request."""
@@ -2371,7 +2430,7 @@ def build_ed2k_link(image: RemoteUdfImage, args, progress_file=None) -> str:
     if getattr(args, "ed2k_auto", False):
         return (
             f"ed2k://|file|{source_filename(image)}|{image.remote.size}|"
-            f"{calculate_ed2k_hash(image, progress_file)}|/"
+            f"{calculate_ed2k_hash(image, progress_file, args.ed2k_workers)}|/"
         )
     return "[待补充 ED2K 链接]"
 
@@ -2847,6 +2906,15 @@ def build_parser():
         "--ed2k-auto",
         action="store_true",
         help="read the complete remote ISO and calculate its real ED2K hash",
+    )
+    bdshare_parser.add_argument(
+        "--ed2k-workers",
+        type=positive_int,
+        default=DEFAULT_ED2K_WORKERS,
+        help=(
+            "parallel HTTP ranges for --ed2k-auto "
+            f"(default: {DEFAULT_ED2K_WORKERS}; keep the range size at the default)"
+        ),
     )
     bdshare_parser.add_argument(
         "-o",
