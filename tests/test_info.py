@@ -105,7 +105,7 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.11.1 (ffprobe)", report)
+        self.assertIn("BDInfo:         remote-bluray 0.11.2 (ffprobe)", report)
         self.assertIn("First 100 seconds only", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
@@ -292,6 +292,11 @@ class InfoTests(TestCase):
         url = "https://example.test/movie.iso"
 
         self.assertEqual(app.source_to_url(f"[movie]({url})"), url)
+        escaped_url = "https://example.test/movie\\(1989\\).iso"
+        self.assertEqual(
+            app.source_to_url(f"[movie]({escaped_url})"),
+            "https://example.test/movie(1989).iso",
+        )
 
     def test_playlist_candidates_skip_playlists_with_missing_m2ts(self):
         valid = app.Playlist(

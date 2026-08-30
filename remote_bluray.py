@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.11.1"
+__version__ = "0.11.2"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
@@ -646,6 +646,7 @@ def source_to_url(source: str | Path) -> str:
     markdown_link = re.fullmatch(r"\[[^\]]+\]\((.+)\)", value)
     if markdown_link:
         value = markdown_link.group(1).strip()
+        value = value.replace(r"\(", "(").replace(r"\)", ")")
     if value.lower().startswith(("http://", "https://")):
         return value
 
