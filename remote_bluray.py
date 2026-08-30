@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.10.3"
+__version__ = "0.10.4"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
@@ -625,25 +625,53 @@ class RemoteRangeReader:
         self._executor = None
 
         session = requests.Session()
-        response = session.get(
-            url,
-            headers={"Range": "bytes=0-0"},
-            allow_redirects=True,
-            timeout=30,
-        )
         try:
-            response.raise_for_status()
-            if response.status_code != 206:
-                raise RuntimeError(f"Remote server does not support Range: HTTP {response.status_code}")
-            content_range = response.headers.get("Content-Range", "")
-            if "/" not in content_range:
-                raise RuntimeError("Remote response has no Content-Range header")
-            self.size = int(content_range.rsplit("/", 1)[1])
-            self.final_url = response.url
+            last_error = None
+            for attempt in range(MAX_RETRIES + 1):
+                response = None
+                try:
+                    # The first request may traverse Emby/Alist redirects to a
+                    # 115 CDN host.  TLS handshakes on that chain can be
+                    # transiently slow, so retry before rejecting the source.
+                    response = session.get(
+                        url,
+                        headers={"Range": "bytes=0-0"},
+                        allow_redirects=True,
+                        timeout=(60, 60),
+                    )
+                    response.raise_for_status()
+                    if response.status_code != 206:
+                        raise RuntimeError(
+                            f"Remote server does not support Range: HTTP {response.status_code}"
+                        )
+                    content_range = response.headers.get("Content-Range", "")
+                    if "/" not in content_range:
+                        raise RuntimeError("Remote response has no Content-Range header")
+                    self.size = int(content_range.rsplit("/", 1)[1])
+                    self.final_url = response.url
+                    break
+                except requests.RequestException as error:
+                    last_error = error
+                    if attempt >= MAX_RETRIES:
+                        raise IOError(
+                            "Initial HTTP Range probe failed after retries; "
+                            "check the CDN/proxy connection and try again"
+                        ) from error
+                    delay = min(8.0, 0.5 * (2**attempt))
+                    if verbose:
+                        print(
+                            "Initial HTTP Range probe failed; "
+                            f"retrying in {delay:.1f}s: {error}"
+                        )
+                    time.sleep(delay)
+                finally:
+                    if response is not None:
+                        response.close()
+            else:  # pragma: no cover - the final retry raises above
+                raise IOError(f"Initial HTTP Range probe failed: {last_error}")
+            self._base_cookies = session.cookies.copy()
         finally:
-            response.close()
-        self._base_cookies = session.cookies.copy()
-        session.close()
+            session.close()
 
         # Keep the default memory footprint bounded even when range-size is
         # increased.  The current chunk plus the prefetch window remain

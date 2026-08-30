@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.10.3-py3-none-any.whl
+python -m pip install remote_bluray-0.10.4-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -81,7 +81,7 @@ python -X utf8 remote_bluray.py list $isoUrl
 
 ## 远程读取速度与并发
 
-远程 ISO 默认使用受控并发 Range 读取：`workers=2`、`prefetch=2`、`range-size=8M`。这会在保持请求量相对温和的同时，提前读取后续数据块。
+远程 ISO 默认使用受控并发 Range 读取：`workers=2`、`prefetch=2`、`range-size=8M`。这会在保持请求量相对温和的同时，提前读取后续数据块。首次 Range 请求会自动重试，以应对 Emby/Alist 重定向到 CDN 时偶发的 TLS 握手超时。
 
 可以根据远程服务器的限速情况调整：
 
