@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.10.4"
+__version__ = "0.11.0"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
@@ -362,6 +362,15 @@ class PlaylistItem:
 
 
 @dataclass(frozen=True)
+class PlaylistChapter:
+    """One chapter mark on the primary playlist timeline."""
+
+    index: int
+    time_seconds: float
+    mark_type: int
+
+
+@dataclass(frozen=True)
 class Playlist:
     name: str
     items: tuple[PlaylistItem, ...]
@@ -369,6 +378,7 @@ class Playlist:
     unique_size_bytes: int = 0
     audio_stream_count: int = -1
     stream_metadata: tuple[tuple[str, str, int], ...] = ()
+    chapters: tuple[PlaylistChapter, ...] = ()
 
     @property
     def duration_seconds(self) -> float:
@@ -505,6 +515,51 @@ def parse_stn_stream_metadata(
     return metadata
 
 
+def parse_mpls_chapters(
+    data: bytes,
+    mark_pos: int,
+    items: list[PlaylistItem],
+) -> tuple[PlaylistChapter, ...]:
+    """Read MPLS play marks and translate them onto the playlist timeline."""
+    if mark_pos <= 0 or mark_pos + 6 > len(data) or not items:
+        return ()
+
+    mark_length = be32(data, mark_pos)
+    mark_end = min(len(data), mark_pos + 4 + mark_length)
+    mark_count = be16(data, mark_pos + 4)
+    cursor = mark_pos + 6
+    item_starts: list[float] = []
+    timeline_position = 0.0
+    for item in items:
+        item_starts.append(timeline_position)
+        timeline_position += item.duration_seconds
+
+    chapters: list[PlaylistChapter] = []
+    for _ in range(mark_count):
+        # Blu-ray PlayMark entries are 14 bytes: reserved, type, play-item
+        # reference, clip timestamp, entry PID, and duration.
+        if cursor + 14 > mark_end:
+            break
+        mark_type = data[cursor + 1]
+        item_index = be16(data, cursor + 2)
+        mark_time = be32(data, cursor + 4)
+        cursor += 14
+        if not mark_type or item_index >= len(items):
+            continue
+
+        item = items[item_index]
+        local_time = (mark_time - item.in_time) / 45000.0
+        local_time = min(item.duration_seconds, max(0.0, local_time))
+        chapters.append(
+            PlaylistChapter(
+                index=len(chapters),
+                time_seconds=item_starts[item_index] + local_time,
+                mark_type=mark_type,
+            )
+        )
+    return tuple(chapters)
+
+
 def parse_mpls(data: bytes, name: str = "") -> Playlist:
     """Parse the primary play items from a Blu-ray MPLS playlist.
 
@@ -517,6 +572,7 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
         raise RuntimeError(f"Invalid MPLS header: {name or '<unnamed>'}")
 
     list_pos = be32(data, 8)
+    mark_pos = be32(data, 12)
     if list_pos + 10 > len(data):
         raise RuntimeError(f"MPLS playlist section is outside the file: {name}")
 
@@ -575,6 +631,7 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
         items=tuple(items),
         audio_stream_count=audio_stream_count,
         stream_metadata=tuple(stream_metadata),
+        chapters=parse_mpls_chapters(data, mark_pos, items),
     )
 
 
@@ -1117,6 +1174,7 @@ class RemoteUdfImage:
                     unique_size_bytes=sum(clip_sizes.values()),
                     audio_stream_count=playlist.audio_stream_count,
                     stream_metadata=playlist.stream_metadata,
+                    chapters=playlist.chapters,
                 )
             )
         return sorted(playlists, key=lambda playlist: playlist.name.casefold())
@@ -1909,6 +1967,260 @@ def format_subtitle_description(stream: dict) -> str:
     return str(title) if title else "-"
 
 
+def integer_value(value) -> int | None:
+    """Return an integer value while accepting ffprobe's string fields."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def stream_disposition(stream: dict, name: str) -> bool:
+    disposition = stream.get("disposition") or {}
+    return bool(disposition.get(name, 0))
+
+
+def emby_codec_name(stream: dict) -> str:
+    codec = str(stream.get("codec_name") or "unknown").casefold()
+    if codec == "hdmv_pgs_subtitle":
+        return "PGSSUB"
+    if codec == "dvd_subtitle":
+        return "DVDSUB"
+    return codec
+
+
+def emby_dolby_vision_info(stream: dict) -> tuple[str | None, str | None]:
+    """Return Emby-style Dolby Vision subtype and description when available."""
+    side_data = stream.get("side_data_list") or stream.get("side_data") or []
+    if not isinstance(side_data, list):
+        return None, None
+    for entry in side_data:
+        if not isinstance(entry, dict):
+            continue
+        type_name = str(
+            entry.get("side_data_type") or entry.get("side_data_type_name") or ""
+        ).casefold()
+        if "dovi" not in type_name and "dolby vision" not in type_name:
+            continue
+        profile = integer_value(entry.get("dv_profile"))
+        compatibility = integer_value(entry.get("bl_signal_compatibility_id"))
+        if profile is None:
+            return "DolbyVision", "Dolby Vision"
+        subtype = f"DoviProfile{profile}"
+        description = f"Profile {profile}"
+        if compatibility is not None:
+            subtype += str(compatibility)
+            description += f".{compatibility}"
+            if compatibility == 1:
+                description += " (HDR10 compatible)"
+        return subtype, description
+    return None, None
+
+
+def emby_video_range(stream: dict, dovi_subtype: str | None) -> str:
+    if dovi_subtype:
+        return "DolbyVision"
+    transfer = str(stream.get("color_transfer") or "").casefold()
+    if transfer in {"smpte2084", "arib-std-b67"}:
+        return "HDR"
+    return "SDR"
+
+
+def emby_display_title(stream: dict, dovi_description: str | None) -> str:
+    stream_type = str(stream.get("codec_type") or "").casefold()
+    codec = emby_codec_name(stream).upper()
+    language = display_language(stream_language(stream))
+    default_suffix = " (默认)" if stream_disposition(stream, "default") else ""
+    if stream_type == "video":
+        width = integer_value(stream.get("width")) or 0
+        height = integer_value(stream.get("height")) or 0
+        resolution = "4K" if width >= 3000 else (f"{height}p" if height else "Video")
+        if dovi_description:
+            return f"{resolution} Dolby Vision {codec}"
+        if emby_video_range(stream, None) == "HDR":
+            return f"{resolution} HDR {codec}"
+        return f"{resolution} {codec}"
+    if stream_type == "audio":
+        profile = str(stream.get("profile") or "").strip()
+        audio_codec = profile if profile else codec
+        layout = display_channel_layout(stream)
+        return " ".join(value for value in (language, audio_codec, layout) if value) + default_suffix
+    if stream_type == "subtitle":
+        default_prefix = "默认 " if stream_disposition(stream, "default") else ""
+        return f"{language} ({default_prefix}{codec})"
+    return codec
+
+
+def emby_stream_info(stream: dict) -> dict:
+    """Map one ffprobe stream to the technical subset of Emby's schema."""
+    stream_type = str(stream.get("codec_type") or "").casefold()
+    type_name = {"video": "Video", "audio": "Audio", "subtitle": "Subtitle"}.get(
+        stream_type,
+        stream_type.title() or "Unknown",
+    )
+    tags = stream.get("tags") or {}
+    dovi_subtype, dovi_description = emby_dolby_vision_info(stream)
+    result: dict[str, object] = {
+        "Codec": emby_codec_name(stream),
+        "Type": type_name,
+        "DisplayTitle": emby_display_title(stream, dovi_description),
+        "IsInterlaced": False,
+        "IsDefault": stream_disposition(stream, "default"),
+        "IsForced": stream_disposition(stream, "forced"),
+        "IsHearingImpaired": stream_disposition(stream, "hearing_impaired"),
+        "IsExternal": False,
+        "IsTextSubtitleStream": False,
+        "SupportsExternalStream": False,
+        # This describes embedded streams in an ISO.  The temporary HTTP
+        # server used during probing is an implementation detail, so use the
+        # same protocol value Emby uses for internally stored media streams.
+        "Protocol": "File",
+        "ExtendedVideoType": "None",
+        "ExtendedVideoSubType": "None",
+        "ExtendedVideoSubTypeDescription": "None",
+        "AttachmentSize": 0,
+    }
+    stream_index = integer_value(stream.get("index"))
+    if stream_index is not None:
+        result["Index"] = stream_index
+    language = stream_language(stream)
+    if language:
+        result["Language"] = language
+    if stream_type in {"audio", "subtitle"}:
+        result["DisplayLanguage"] = display_language(language)
+    title = tags.get("title") or tags.get("TITLE")
+    if title:
+        result["Title"] = str(title)
+    time_base = stream.get("time_base")
+    if time_base and str(time_base).upper() != "N/A":
+        result["TimeBase"] = str(time_base)
+    bitrate = stream_bitrate(stream)
+    if bitrate:
+        result["BitRate"] = int(round(bitrate))
+
+    if stream_type == "video":
+        for field, output_name in (
+            ("width", "Width"),
+            ("height", "Height"),
+            ("bits_per_raw_sample", "BitDepth"),
+            ("refs", "RefFrames"),
+            ("level", "Level"),
+        ):
+            value = integer_value(stream.get(field))
+            if value is not None:
+                result[output_name] = value
+        for field, output_name in (
+            ("avg_frame_rate", "AverageFrameRate"),
+            ("r_frame_rate", "RealFrameRate"),
+        ):
+            value = rational_float(stream.get(field))
+            if value:
+                result[output_name] = value
+        profile = str(stream.get("profile") or "").strip()
+        if profile:
+            result["Profile"] = profile
+        aspect_ratio = display_aspect_ratio(stream)
+        if aspect_ratio:
+            result["AspectRatio"] = aspect_ratio
+        for field, output_name in (
+            ("pix_fmt", "PixelFormat"),
+            ("color_transfer", "ColorTransfer"),
+            ("color_primaries", "ColorPrimaries"),
+            ("color_space", "ColorSpace"),
+        ):
+            value = str(stream.get(field) or "").strip()
+            if value and value.upper() != "N/A":
+                result[output_name] = value
+        field_order = str(stream.get("field_order") or "").casefold()
+        result["IsInterlaced"] = field_order not in {"", "unknown", "progressive", "n/a"}
+        result["IsAnamorphic"] = False
+        result["VideoRange"] = emby_video_range(stream, dovi_subtype)
+        if dovi_subtype:
+            result["ExtendedVideoType"] = "DolbyVision"
+            result["ExtendedVideoSubType"] = dovi_subtype
+            result["ExtendedVideoSubTypeDescription"] = dovi_description
+    elif stream_type == "audio":
+        for field, output_name in (
+            ("channels", "Channels"),
+            ("sample_rate", "SampleRate"),
+            ("bits_per_sample", "BitDepth"),
+        ):
+            value = integer_value(stream.get(field))
+            if value is not None:
+                result[output_name] = value
+        layout = display_channel_layout(stream)
+        if layout:
+            result["ChannelLayout"] = layout
+        profile = str(stream.get("profile") or "").strip()
+        if profile:
+            result["Profile"] = profile
+    elif stream_type == "subtitle":
+        text_subtitle = emby_codec_name(stream).casefold() in {
+            "subrip",
+            "ass",
+            "ssa",
+            "webvtt",
+            "mov_text",
+            "text",
+        }
+        result["IsTextSubtitleStream"] = text_subtitle
+        result["SupportsExternalStream"] = text_subtitle
+        result["SubtitleLocationType"] = "InternalStream"
+    return result
+
+
+def format_emby_json(
+    image: RemoteUdfImage,
+    playlist: Playlist,
+    media_info: dict,
+    scan_mode: str,
+    partial_seconds: float,
+) -> list[dict]:
+    """Build an Emby-style technical media-info payload for the main title."""
+    streams = add_playlist_languages(playlist, list(media_info.get("streams", [])))
+    chapters = [
+        {
+            "StartPositionTicks": int(round(chapter.time_seconds * 10_000_000)),
+            "Name": f"Chapter {chapter.index + 1:02d}",
+            "MarkerType": "Chapter",
+            "ChapterIndex": chapter.index,
+        }
+        for chapter in playlist.chapters
+    ]
+    media_source = {
+        "Chapters": [],
+        "Protocol": "File",
+        "Type": "Default",
+        "Container": "bluray",
+        "Size": playlist.size_bytes,
+        "IsRemote": True,
+        "HasMixedProtocols": False,
+        "RunTimeTicks": int(round(playlist.duration_seconds * 10_000_000)),
+        "SupportsProbing": True,
+        "MediaStreams": [emby_stream_info(stream) for stream in streams],
+        "Formats": [],
+        "Bitrate": int(round(playlist.total_bitrate_mbps * 1_000_000)),
+        "RequiredHttpHeaders": {},
+        "AddApiKeyToDirectStreamUrl": False,
+        "ReadAtNativeFramerate": False,
+    }
+    return [
+        {
+            "MediaSourceInfo": media_source,
+            "Chapters": chapters,
+            "ZeroFingerprintConfidence": False,
+            "RemoteBluray": {
+                "DiscSize": image.remote.size,
+                "Playlist": playlist.name.upper(),
+                "Scan": "Complete file" if scan_mode == "full" else "Partial",
+                "ScanDurationSeconds": playlist.duration_seconds
+                if scan_mode == "full"
+                else min(partial_seconds, playlist.duration_seconds),
+            },
+        }
+    ]
+
+
 def stream_signature(stream: dict) -> tuple[str, str, str, str]:
     tags = stream.get("tags") or {}
     language = str(tags.get("language") or tags.get("LANGUAGE") or "").casefold()
@@ -2384,38 +2696,58 @@ def collect_info_result(args, image: RemoteUdfImage, progress_file=None) -> dict
     return {
         "playlist": playlist,
         "report": format_info_report(image, playlist, media_info, args.scan, partial_seconds),
+        "emby_json": format_emby_json(
+            image,
+            playlist,
+            media_info,
+            args.scan,
+            partial_seconds,
+        ),
         "screenshots": screenshot_outputs,
         "screenshot_subtitle": screenshot_subtitle,
         "screenshot_skip_start": screenshot_skip_start,
     }
 
 
-def print_info_result(args, result: dict) -> None:
-    print(result["report"], flush=True)
+def print_info_result(args, result: dict, auxiliary_file=None) -> None:
+    if args.output_format == "emby-json":
+        # Keep stdout machine-readable so callers can redirect it directly to
+        # a .json file.  Progress and optional screenshot paths use stderr.
+        print(json.dumps(result["emby_json"], ensure_ascii=False, indent=2), flush=True)
+        output_file = auxiliary_file
+    else:
+        print(result["report"], flush=True)
+        output_file = None
     screenshot_outputs = result["screenshots"]
     if not screenshot_outputs:
         return
     screenshot_subtitle = result["screenshot_subtitle"]
-    print("\nSCREENSHOTS:", flush=True)
+    print("\nSCREENSHOTS:", file=output_file, flush=True)
     if screenshot_subtitle:
         print(
             f"  Subtitle: {screenshot_subtitle[1]} "
             f"(subtitle stream {screenshot_subtitle[0] + 1})",
+            file=output_file,
             flush=True,
         )
     elif args.screenshot_subtitle == "none":
-        print("  Subtitle: disabled", flush=True)
+        print("  Subtitle: disabled", file=output_file, flush=True)
     else:
-        print("  Subtitle: no Chinese subtitle found", flush=True)
-    print(f"  Skip start: {result['screenshot_skip_start']:g} seconds", flush=True)
+        print("  Subtitle: no Chinese subtitle found", file=output_file, flush=True)
+    print(
+        f"  Skip start: {result['screenshot_skip_start']:g} seconds",
+        file=output_file,
+        flush=True,
+    )
     for output in screenshot_outputs:
-        print(f"  {output}", flush=True)
+        print(f"  {output}", file=output_file, flush=True)
 
 
 def command_info(args):
     image = image_from_args(args)
-    result = collect_info_result(args, image)
-    print_info_result(args, result)
+    auxiliary_file = sys.stderr if args.output_format == "emby-json" else None
+    result = collect_info_result(args, image, progress_file=auxiliary_file)
+    print_info_result(args, result, auxiliary_file=auxiliary_file)
 
 
 def load_tmdb_module(script_path: str | Path):
@@ -2821,6 +3153,13 @@ def build_parser():
         "--scan-duration",
         default=str(int(INFO_PARTIAL_SECONDS)),
         help="partial scan duration in seconds or H:M:S (default: 100 seconds)",
+    )
+    info_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("bdinfo", "emby-json"),
+        default="bdinfo",
+        help="output format: BDInfo-style text or Emby-compatible JSON (default: bdinfo)",
     )
     info_parser.add_argument(
         "--screenshots",

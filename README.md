@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.10.4-py3-none-any.whl
+python -m pip install remote_bluray-0.11.0-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -156,6 +156,16 @@ python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm" --scan part
 不指定 `--scan partial` 时，截图时间范围覆盖完整主播放列表；不指定 `--screenshots` 时不会生成截图。
 
 码率由扫描区间内各流的实际 packet 字节数计算。部分扫描适合先快速确认编码、语言和轨道布局，但码率只代表指定区间样本；如果某条字幕在指定区间没有出现 packet，其码率会显示为 `-`。报告中的主播放列表总大小、时长和总码率仍按完整播放列表计算。
+
+### Emby 媒体信息 JSON
+
+使用 `--format emby-json` 可将同一主播放列表输出为 Emby 风格的媒体信息 JSON，包含 `MediaSourceInfo`、`MediaStreams` 和 `.mpls` 章节标记。视频流会包含分辨率、帧率、色彩信息、HDR / Dolby Vision 信息（如果 ffprobe 能识别）；音频和字幕流会包含语言、标题、默认/强制/听障标记和扫描得到的码率。
+
+```powershell
+remote-bluray info "D:\Cinema\strm\...\movie.strm" --scan partial --format emby-json > "D:\output\movie-mediainfo.json"
+```
+
+JSON 本身只写入标准输出，扫描进度和截图路径写入标准错误，因此可安全地重定向为 `.json` 文件。此输出是 Emby 兼容的技术媒体信息，而非 Emby 服务端的完整数据库记录：播放能力、认证头等依赖服务端配置的字段不会伪造。
 
 ## 生成 BDShare 发布文稿
 

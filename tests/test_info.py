@@ -1,4 +1,7 @@
 import json
+import struct
+from contextlib import redirect_stdout
+from io import StringIO
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
@@ -102,7 +105,7 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.10.4 (ffprobe)", report)
+        self.assertIn("BDInfo:         remote-bluray 0.11.0 (ffprobe)", report)
         self.assertIn("First 100 seconds only", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
@@ -162,6 +165,123 @@ class InfoTests(TestCase):
         self.assertEqual(args.screenshot_subtitle, "none")
         self.assertEqual(app.parse_duration(args.scan_duration), 300)
         self.assertEqual(app.parse_duration(args.screenshot_skip_start), 120)
+
+    def test_emby_json_format_includes_stream_metadata_and_chapters(self):
+        playlist = app.Playlist(
+            name="00001.mpls",
+            items=(app.PlaylistItem("00001", "M2TS", 0, 4_500_000),),
+            size_bytes=987654321,
+            unique_size_bytes=987654321,
+            chapters=(
+                app.PlaylistChapter(index=0, time_seconds=0, mark_type=1),
+                app.PlaylistChapter(index=1, time_seconds=300, mark_type=1),
+            ),
+        )
+        media_info = {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "video",
+                    "codec_name": "hevc",
+                    "width": 3840,
+                    "height": 2160,
+                    "avg_frame_rate": "24000/1001",
+                    "r_frame_rate": "24000/1001",
+                    "profile": "Main 10",
+                    "level": 153,
+                    "pix_fmt": "yuv420p10le",
+                    "color_transfer": "smpte2084",
+                    "color_primaries": "bt2020",
+                    "color_space": "bt2020nc",
+                    "bit_rate": "35000000",
+                    "disposition": {"default": 1},
+                    "side_data_list": [
+                        {
+                            "side_data_type": "DOVI configuration record",
+                            "dv_profile": 8,
+                            "bl_signal_compatibility_id": 1,
+                        }
+                    ],
+                },
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "truehd",
+                    "profile": "TrueHD",
+                    "channels": 8,
+                    "channel_layout": "7.1",
+                    "sample_rate": "48000",
+                    "bits_per_sample": 24,
+                    "bit_rate": "4500000",
+                    "tags": {"language": "eng", "title": "English Atmos"},
+                    "disposition": {"default": 1},
+                },
+                {
+                    "index": 2,
+                    "codec_type": "subtitle",
+                    "codec_name": "hdmv_pgs_subtitle",
+                    "tags": {"language": "chi", "title": "简体中文"},
+                    "disposition": {"forced": 1},
+                },
+            ]
+        }
+
+        payload = app.format_emby_json(FakeImage(), playlist, media_info, "partial", 100)
+
+        self.assertEqual(len(payload), 1)
+        source = payload[0]["MediaSourceInfo"]
+        self.assertEqual(source["Container"], "bluray")
+        self.assertEqual(source["RunTimeTicks"], 1_000_000_000)
+        self.assertEqual(source["Bitrate"], 79_012_346)
+        video, audio, subtitle = source["MediaStreams"]
+        self.assertEqual(video["ExtendedVideoType"], "DolbyVision")
+        self.assertEqual(video["ExtendedVideoSubType"], "DoviProfile81")
+        self.assertEqual(video["VideoRange"], "DolbyVision")
+        self.assertEqual(video["Protocol"], "File")
+        self.assertNotIn("DisplayLanguage", video)
+        self.assertEqual(audio["Title"], "English Atmos")
+        self.assertTrue(audio["IsDefault"])
+        self.assertEqual(subtitle["Codec"], "PGSSUB")
+        self.assertTrue(subtitle["IsForced"])
+        self.assertEqual(subtitle["DisplayTitle"], "Chinese (PGSSUB)")
+        self.assertEqual(subtitle["SubtitleLocationType"], "InternalStream")
+        self.assertEqual(payload[0]["Chapters"][1]["StartPositionTicks"], 3_000_000_000)
+        self.assertEqual(payload[0]["RemoteBluray"]["ScanDurationSeconds"], 100)
+
+    def test_info_parser_and_printer_support_emby_json(self):
+        args = app.build_parser().parse_args(
+            ["info", "source.iso", "--format", "emby-json"]
+        )
+        result = {"emby_json": [{"MediaSourceInfo": {}}], "screenshots": []}
+        output = StringIO()
+
+        with redirect_stdout(output):
+            app.print_info_result(args, result)
+
+        self.assertEqual(json.loads(output.getvalue()), result["emby_json"])
+
+    def test_mpls_play_marks_are_translated_to_playlist_chapters(self):
+        data = bytearray(64)
+        mark_pos = 8
+        struct.pack_into(">I", data, mark_pos, 30)
+        struct.pack_into(">H", data, mark_pos + 4, 2)
+        data[mark_pos + 7] = 1
+        struct.pack_into(">H", data, mark_pos + 8, 0)
+        struct.pack_into(">I", data, mark_pos + 10, 45_000)
+        data[mark_pos + 21] = 1
+        struct.pack_into(">H", data, mark_pos + 22, 1)
+        struct.pack_into(">I", data, mark_pos + 24, 22_500)
+        items = [
+            app.PlaylistItem("00001", "M2TS", 0, 90_000),
+            app.PlaylistItem("00002", "M2TS", 0, 90_000),
+        ]
+
+        chapters = app.parse_mpls_chapters(data, mark_pos, items)
+
+        self.assertEqual(
+            [(chapter.index, chapter.time_seconds) for chapter in chapters],
+            [(0, 1.0), (1, 2.5)],
+        )
 
     def test_chooses_first_chinese_subtitle_stream(self):
         streams = [
