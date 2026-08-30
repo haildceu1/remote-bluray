@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -40,10 +41,11 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
+INFO_DEFAULT_RANGE_SIZE = 4 * 1024 * 1024
 DEFAULT_WORKERS = 2
 DEFAULT_PREFETCH = 2
 DEFAULT_ED2K_WORKERS = 2
@@ -638,6 +640,12 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
 def source_to_url(source: str | Path) -> str:
     """Read a .strm file or accept an HTTP(S) ISO URL directly."""
     value = str(source).strip()
+    # A URL copied from rendered Markdown can arrive as ``[label](url)``.
+    # Accept that harmless wrapper so the command remains usable when copied
+    # from a chat or web page.
+    markdown_link = re.fullmatch(r"\[[^\]]+\]\((.+)\)", value)
+    if markdown_link:
+        value = markdown_link.group(1).strip()
     if value.lower().startswith(("http://", "https://")):
         return value
 
@@ -1015,6 +1023,8 @@ class RemoteUdfImage:
         self.partition_lengths: dict[int, int] = {}
         self.metadata_partition = None
         self.root_icb = None
+        self._entry_cache: dict[tuple[int, int], dict] = {}
+        self._directory_cache: dict[tuple[int, tuple], list[dict]] = {}
         self._parse_volume()
 
     def partition_base(self, partition: int) -> int:
@@ -1108,12 +1118,31 @@ class RemoteUdfImage:
         return self.remote.read_range(absolute, BLOCK_SIZE)
 
     def _entry_from_icb(self, icb: dict) -> dict:
-        block = self.remote.read_block(self.partition_starts[icb["partition"]] + icb["lba"])
-        return decode_file_entry(block, icb["partition"])
+        key = (icb["partition"], icb["lba"])
+        entry = self._entry_cache.get(key)
+        if entry is None:
+            block = self.remote.read_block(
+                self.partition_starts[icb["partition"]] + icb["lba"]
+            )
+            entry = decode_file_entry(block, icb["partition"])
+            self._entry_cache[key] = entry
+        return entry
 
     def _directory_from_entry(self, entry: dict, partition: int) -> list[dict]:
+        key = (
+            partition,
+            tuple(
+                (ad["kind"], ad["lba"], ad["length"], ad["partition"])
+                for ad in entry["ads"]
+            ),
+        )
+        cached = self._directory_cache.get(key)
+        if cached is not None:
+            return cached
         udf_file = UdfFile(self, "<directory>", entry, partition)
-        return decode_directory_entries(udf_file.read_all())
+        entries = decode_directory_entries(udf_file.read_all())
+        self._directory_cache[key] = entries
+        return entries
 
     def _find_in_directory(self, entries: Iterable[dict], name: str) -> dict:
         folded = name.casefold()
@@ -1155,16 +1184,53 @@ class RemoteUdfImage:
 
     def playlist_candidates(self) -> list[Playlist]:
         playlists = []
+        stream_names = {
+            entry["name"].casefold()
+            for entry in self.list_dir("/BDMV/STREAM")
+            if not entry["directory"]
+        }
+        clip_size_cache: dict[str, int] = {}
+        missing_clips: set[str] = set()
         for item in self.list_dir("/BDMV/PLAYLIST"):
             name = item["name"]
             if item["directory"] or not name.lower().endswith(".mpls"):
                 continue
             path = f"/BDMV/PLAYLIST/{name}"
             playlist = parse_mpls(self.find(path).read_all(), name=name)
-            clip_sizes = {
-                item.clip_id: self.find(f"/BDMV/STREAM/{item.clip_id}.m2ts").size
-                for item in playlist.items
-            }
+            clip_sizes = {}
+            missing_clip = False
+            for playlist_item in playlist.items:
+                if playlist_item.clip_id in clip_sizes:
+                    continue
+                if playlist_item.clip_id in missing_clips:
+                    missing_clip = True
+                    break
+                if playlist_item.clip_id in clip_size_cache:
+                    clip_sizes[playlist_item.clip_id] = clip_size_cache[playlist_item.clip_id]
+                    continue
+                clip_name = f"{playlist_item.clip_id}.m2ts"
+                if clip_name.casefold() not in stream_names:
+                    # Avoid an extra directory traversal for stale playlist
+                    # references; some discs contain many of these entries.
+                    missing_clips.add(playlist_item.clip_id)
+                    missing_clip = True
+                    break
+                try:
+                    clip_size = self.find(
+                        f"/BDMV/STREAM/{clip_name}"
+                    ).size
+                    clip_size_cache[playlist_item.clip_id] = clip_size
+                    clip_sizes[playlist_item.clip_id] = clip_size
+                except FileNotFoundError:
+                    # Some authoring tools leave short or obsolete MPLS
+                    # entries behind after removing their M2TS clips.  Such a
+                    # playlist cannot be probed or selected, but it should
+                    # not prevent valid feature playlists from being listed.
+                    missing_clips.add(playlist_item.clip_id)
+                    missing_clip = True
+                    break
+            if missing_clip:
+                continue
             size_bytes = sum(clip_sizes.get(item.clip_id, 0) for item in playlist.items)
             playlists.append(
                 Playlist(
@@ -3094,10 +3160,23 @@ def parse_range_size(value: str) -> int:
     return parsed
 
 
-def add_remote_options(parser, suppress_defaults: bool = False) -> None:
+def add_remote_options(
+    parser,
+    suppress_defaults: bool = False,
+    range_size_default: int | None = None,
+) -> None:
     default_workers = argparse.SUPPRESS if suppress_defaults else DEFAULT_WORKERS
     default_prefetch = argparse.SUPPRESS if suppress_defaults else DEFAULT_PREFETCH
     default_range_size = argparse.SUPPRESS if suppress_defaults else DEFAULT_RANGE_SIZE
+    if range_size_default is not None:
+        default_range_size = range_size_default
+    if isinstance(default_range_size, int):
+        range_size_help = (
+            "HTTP Range chunk size, e.g. 4M, 8M, or 8388608 "
+            f"(default: {default_range_size // (1024 * 1024)}M)"
+        )
+    else:
+        range_size_help = "HTTP Range chunk size, e.g. 4M, 8M, or 8388608"
     parser.add_argument(
         "--workers",
         type=positive_int,
@@ -3115,7 +3194,7 @@ def add_remote_options(parser, suppress_defaults: bool = False) -> None:
         type=parse_range_size,
         default=default_range_size,
         metavar="SIZE",
-        help="HTTP Range chunk size, e.g. 4M, 8M, or 8388608",
+        help=range_size_help,
     )
 
 
@@ -3135,7 +3214,11 @@ def build_parser():
         "info",
         help="report BDInfo-style encoding details for the main playlist",
     )
-    add_remote_options(info_parser, suppress_defaults=True)
+    add_remote_options(
+        info_parser,
+        suppress_defaults=True,
+        range_size_default=INFO_DEFAULT_RANGE_SIZE,
+    )
     info_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
     info_parser.add_argument(
         "--mode",

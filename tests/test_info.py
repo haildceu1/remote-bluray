@@ -105,7 +105,7 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.11.0 (ffprobe)", report)
+        self.assertIn("BDInfo:         remote-bluray 0.11.1 (ffprobe)", report)
         self.assertIn("First 100 seconds only", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
@@ -165,6 +165,11 @@ class InfoTests(TestCase):
         self.assertEqual(args.screenshot_subtitle, "none")
         self.assertEqual(app.parse_duration(args.scan_duration), 300)
         self.assertEqual(app.parse_duration(args.screenshot_skip_start), 120)
+
+    def test_info_uses_4m_range_chunks_by_default(self):
+        args = app.build_parser().parse_args(["info", "source.iso"])
+
+        self.assertEqual(args.range_size, 4 * 1024 * 1024)
 
     def test_emby_json_format_includes_stream_metadata_and_chapters(self):
         playlist = app.Playlist(
@@ -282,6 +287,51 @@ class InfoTests(TestCase):
             [(chapter.index, chapter.time_seconds) for chapter in chapters],
             [(0, 1.0), (1, 2.5)],
         )
+
+    def test_source_to_url_unwraps_markdown_link(self):
+        url = "https://example.test/movie.iso"
+
+        self.assertEqual(app.source_to_url(f"[movie]({url})"), url)
+
+    def test_playlist_candidates_skip_playlists_with_missing_m2ts(self):
+        valid = app.Playlist(
+            name="00800.mpls",
+            items=(app.PlaylistItem("00000", "M2TS", 0, 90_000),),
+        )
+        missing = app.Playlist(
+            name="01628.mpls",
+            items=(app.PlaylistItem("00676", "M2TS", 0, 90_000),),
+        )
+
+        class CandidateImage:
+            verbose = False
+
+            def list_dir(self, path):
+                if path == "/BDMV/STREAM":
+                    return [
+                        {"name": "00000.m2ts", "directory": False},
+                    ]
+                if path == "/BDMV/PLAYLIST":
+                    return [
+                        {"name": "01628.mpls", "directory": False},
+                        {"name": "00800.mpls", "directory": False},
+                    ]
+                raise AssertionError(path)
+
+            def find(self, path):
+                if path.endswith("01628.mpls") or path.endswith("00800.mpls"):
+                    return SimpleNamespace(read_all=lambda: b"playlist")
+                if path.endswith("00676.m2ts"):
+                    raise FileNotFoundError(path)
+                if path.endswith("00000.m2ts"):
+                    return SimpleNamespace(size=1234)
+                raise AssertionError(path)
+
+        with patch.object(app, "parse_mpls", side_effect=[missing, valid]):
+            playlists = app.RemoteUdfImage.playlist_candidates(CandidateImage())
+
+        self.assertEqual([playlist.name for playlist in playlists], ["00800.mpls"])
+        self.assertEqual(playlists[0].size_bytes, 1234)
 
     def test_chooses_first_chinese_subtitle_stream(self):
         streams = [

@@ -48,7 +48,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.11.0-py3-none-any.whl
+python -m pip install remote_bluray-0.11.1-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -124,6 +124,8 @@ Playlists: 13 (excluding .mpls.backup)
 ## 提取主片编码信息
 
 `info` 使用已有的 `main` 播放列表选择逻辑，生成标准 BDInfo 风格的报告，包含碟片信息、播放列表、视频、音频、字幕和 M2TS 文件明细。流信息标题后使用独立的 `---` 分隔行，适合直接放入 BBCode 的 `[code]` 区块：
+
+`info` 默认使用 4M HTTP Range 分块，适合部分远程 CDN；可用 `--range-size`、`--workers` 和 `--prefetch` 按服务器情况调整。
 
 ```powershell
 python -X utf8 remote_bluray.py info "D:\Cinema\strm\...\movie.strm"
