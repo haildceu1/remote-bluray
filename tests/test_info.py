@@ -30,7 +30,7 @@ class InfoTests(TestCase):
             unique_size_bytes=987654321,
         )
 
-    def test_partial_probe_limits_interval_to_first_100_seconds(self):
+    def test_partial_probe_uses_short_low_traffic_default_window(self):
         completed = SimpleNamespace(
             returncode=0,
             stdout=json.dumps({"streams": [], "format": {}}),
@@ -44,14 +44,14 @@ class InfoTests(TestCase):
         self.assertEqual(payload["streams"], [])
         command = run.call_args.args[0]
         self.assertIn("-read_intervals", command)
-        self.assertIn("%+100", command)
+        self.assertIn("%+10", command)
 
     def test_packet_bitrates_use_the_scan_window(self):
         media_info = {"streams": [{"index": 0, "codec_type": "video"}]}
 
         app.apply_packet_bitrates(media_info, {0: 1_000_000}, 200, "partial")
 
-        self.assertEqual(app.format_bitrate_value(media_info["streams"][0]["bit_rate"]), "80 kbps")
+        self.assertEqual(app.format_bitrate_value(media_info["streams"][0]["bit_rate"]), "800 kbps")
 
     def test_partial_probe_accepts_custom_duration(self):
         completed = SimpleNamespace(
@@ -105,8 +105,8 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.11.2 (ffprobe)", report)
-        self.assertIn("First 100 seconds only", report)
+        self.assertIn("BDInfo:         remote-bluray 0.11.3 (ffprobe)", report)
+        self.assertIn("Middle sample: 10 seconds at 0s", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
         self.assertIn("English", report)
@@ -166,10 +166,10 @@ class InfoTests(TestCase):
         self.assertEqual(app.parse_duration(args.scan_duration), 300)
         self.assertEqual(app.parse_duration(args.screenshot_skip_start), 120)
 
-    def test_info_uses_4m_range_chunks_by_default(self):
+    def test_info_uses_1m_range_chunks_by_default(self):
         args = app.build_parser().parse_args(["info", "source.iso"])
 
-        self.assertEqual(args.range_size, 4 * 1024 * 1024)
+        self.assertEqual(args.range_size, 1 * 1024 * 1024)
 
     def test_emby_json_format_includes_stream_metadata_and_chapters(self):
         playlist = app.Playlist(
@@ -310,6 +310,7 @@ class InfoTests(TestCase):
 
         class CandidateImage:
             verbose = False
+            _playlist_cache = None
 
             def list_dir(self, path):
                 if path == "/BDMV/STREAM":
@@ -329,7 +330,7 @@ class InfoTests(TestCase):
                 if path.endswith("00676.m2ts"):
                     raise FileNotFoundError(path)
                 if path.endswith("00000.m2ts"):
-                    return SimpleNamespace(size=1234)
+                    return SimpleNamespace(size=1234, is_complete=True)
                 raise AssertionError(path)
 
         with patch.object(app, "parse_mpls", side_effect=[missing, valid]):
@@ -337,6 +338,109 @@ class InfoTests(TestCase):
 
         self.assertEqual([playlist.name for playlist in playlists], ["00800.mpls"])
         self.assertEqual(playlists[0].size_bytes, 1234)
+
+    def test_playlist_pid_filter_removes_unselected_clip_streams(self):
+        playlist = app.Playlist(
+            "00800.mpls",
+            (app.PlaylistItem("00293", "M2TS", 0, 45000),),
+            stream_metadata=(
+                ("video", "", 36),
+                ("audio", "eng", 131),
+                ("subtitle", "eng", 144),
+                ("subtitle", "zho", 144),
+            ),
+            stream_pid_metadata=(
+                ("video", "", 36, 0x1011),
+                ("audio", "eng", 131, 0x1100),
+                ("subtitle", "eng", 144, 0x12A0),
+                ("subtitle", "zho", 144, 0x12A1),
+            ),
+        )
+        streams = [
+            {"index": 0, "id": "0x1011", "codec_type": "video"},
+            {"index": 1, "id": "0x1015", "codec_type": "video"},
+            {"index": 2, "id": "0x1100", "codec_type": "audio"},
+            {"index": 3, "id": "0x12a0", "codec_type": "subtitle"},
+            {"index": 4, "id": "0x12a1", "codec_type": "subtitle"},
+            {"index": 5, "id": "0x12a2", "codec_type": "subtitle"},
+        ]
+
+        result = app.playlist_streams(playlist, streams)
+
+        self.assertEqual([stream["id"] for stream in result], ["0x1011", "0x1100", "0x12a0", "0x12a1"])
+        self.assertEqual(result[2]["tags"]["language"], "eng")
+        self.assertEqual(result[3]["tags"]["language"], "zho")
+
+    def test_subtitle_language_inference_is_conservative(self):
+        self.assertEqual(app.infer_language_from_text("第一行中文字幕\n第二行"), "zho")
+        self.assertEqual(app.infer_language_from_text("これは日本語の字幕です"), "jpn")
+        self.assertEqual(app.infer_language_from_name("movie.zh-Hans.srt"), "zho")
+        self.assertEqual(app.infer_language_from_text("bonjour le monde ceci est une phrase"), "")
+
+    def test_attached_repeated_tail_keeps_declared_timeline(self):
+        feature = app.PlaylistItem("00304", "M2TS", 0, 3_767_000)
+        loop = app.PlaylistItem("00295", "M2TS", 0, 3_767_000)
+        source = (feature,) + (loop,) * 300
+
+        normalized, note = app.normalize_playlist_items(source)
+        playlist = app.Playlist(
+            "00021.mpls",
+            normalized,
+            size_bytes=33_850_398_720,
+            unique_size_bytes=224_925_696,
+            source_items=source,
+            normalization_note=note,
+        )
+
+        self.assertEqual(playlist.items, source)
+        self.assertEqual(playlist.clip_ids[0], "00304")
+        self.assertEqual(playlist.clip_ids.count("00295"), 300)
+        self.assertAlmostEqual(playlist.duration_seconds, 83.711111 * 301, places=4)
+        self.assertEqual(playlist.main_selection_duration, playlist.duration_seconds)
+        self.assertIn("retained attached repeated clip 00295.m2ts x300", note or "")
+
+    def test_pure_loop_is_reduced_and_still_marked_as_looping(self):
+        item = app.PlaylistItem("00295", "M2TS", 0, 450_000)
+        source = (item,) * 300
+        normalized, note = app.normalize_playlist_items(source)
+        playlist = app.Playlist("00023.mpls", normalized, source_items=source, normalization_note=note)
+
+        self.assertEqual(len(playlist.items), 1)
+        self.assertEqual(playlist.looping_period, 1)
+        self.assertTrue(playlist.is_looping)
+
+    def test_main_selection_uses_attached_playlist_timeline(self):
+        feature = app.PlaylistItem("00304", "M2TS", 0, 3_767_000)
+        loop = app.PlaylistItem("00295", "M2TS", 0, 3_767_000)
+        source = (feature,) + (loop,) * 300
+        normalized, note = app.normalize_playlist_items(source)
+        attached = app.Playlist(
+            "00021.mpls", normalized, source_items=source, normalization_note=note
+        )
+        bonus = app.Playlist(
+            "00801.mpls", (app.PlaylistItem("00306", "M2TS", 0, 50_000_000),)
+        )
+
+        self.assertEqual(app.main_playlist([attached, bonus]).name, "00021.mpls")
+
+    def test_physical_extent_beyond_eof_is_detected_without_reading_media(self):
+        class Remote:
+            size = 1_000
+
+        class Image:
+            remote = Remote()
+
+            @staticmethod
+            def partition_base(_partition):
+                return 0
+
+        file = app.UdfFile(
+            Image(),
+            "/BDMV/STREAM/00002.m2ts",
+            {"length": 2_048, "ads": [{"kind": 0, "partition": 0, "lba": 0, "length": 2_048}]},
+            0,
+        )
+        self.assertFalse(file.is_complete)
 
     def test_chooses_first_chinese_subtitle_stream(self):
         streams = [

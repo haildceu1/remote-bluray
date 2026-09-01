@@ -41,15 +41,17 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.11.2"
+__version__ = "0.11.3"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
-INFO_DEFAULT_RANGE_SIZE = 4 * 1024 * 1024
 DEFAULT_WORKERS = 2
 DEFAULT_PREFETCH = 2
 DEFAULT_ED2K_WORKERS = 2
 MAX_RETRIES = 4
+INFO_DEFAULT_WORKERS = 1
+INFO_DEFAULT_PREFETCH = 0
+INFO_DEFAULT_RANGE_SIZE = 1 * 1024 * 1024
 
 
 def md4_digest(data: bytes) -> bytes:
@@ -372,6 +374,77 @@ class PlaylistChapter:
     mark_type: int
 
 
+def _looping_period(items: tuple[PlaylistItem, ...]) -> int | None:
+    """Return the exact repeated cycle length for a playlist."""
+    item_count = len(items)
+    if item_count < 3:
+        return None
+    for period in range(1, item_count // 3 + 1):
+        cycle_count = item_count / period
+        if cycle_count < 3:
+            continue
+        matches = sum(items[index] == items[index % period] for index in range(item_count))
+        # A single prefix/suffix item must not be swallowed as a tolerant
+        # loop.  ``00304, 00295 x300`` is a valid non-periodic timeline and
+        # must remain eligible as the main playlist.
+        if matches != item_count:
+            continue
+        cycle_duration = sum(item.duration_seconds for item in items[:period])
+        total_duration = sum(item.duration_seconds for item in items)
+        if cycle_duration > 0 and total_duration / cycle_duration >= 3:
+            return period
+    return None
+
+
+def _attached_loop_run(items: tuple[PlaylistItem, ...]) -> tuple[int, int] | None:
+    """Find a long repeated run appended to an otherwise useful playlist.
+
+    A few discs contain a valid feature play item followed by a menu/loop
+    clip hundreds of times, for example ``00304, 00295 x300``.  That is not
+    an exact periodic playlist, so the old loop detector did not recognize
+    it.  Only accept a run that is both long (at least three copies) and at
+    least 75% of the playlist, which avoids changing ordinary multi-segment
+    feature playlists.
+    """
+    if len(items) < 4:
+        return None
+    index = 0
+    best: tuple[int, int] | None = None
+    while index < len(items):
+        end = index + 1
+        while end < len(items) and items[end] == items[index]:
+            end += 1
+        count = end - index
+        if count >= 3 and count >= max(3, int(len(items) * 0.75)):
+            if best is None or count > best[1] - best[0]:
+                best = (index, end)
+        index = end
+    return best
+
+
+def normalize_playlist_items(
+    items: tuple[PlaylistItem, ...],
+) -> tuple[tuple[PlaylistItem, ...], str | None]:
+    """Collapse only exact periodic loops without changing valid timelines.
+
+    A long repeated run with a non-repeating prefix is not an exact loop.  It
+    can be an unusual but valid main playlist, so keep its declared timeline
+    instead of guessing that the repeated clip is disposable menu content.
+    """
+    period = _looping_period(items)
+    if period is not None:
+        return items[:period], f"collapsed exact loop ({len(items)} -> {period} play item(s))"
+
+    run = _attached_loop_run(items)
+    if run is None:
+        return items, None
+    start, end = run
+    return items, (
+        f"retained attached repeated clip {items[start].clip_id}.m2ts "
+        f"x{end - start} ({len(items)} play item(s))"
+    )
+
+
 @dataclass(frozen=True)
 class Playlist:
     name: str
@@ -380,7 +453,15 @@ class Playlist:
     unique_size_bytes: int = 0
     audio_stream_count: int = -1
     stream_metadata: tuple[tuple[str, str, int], ...] = ()
+    # The MPLS STN table also carries the transport-stream PID.  Keep this
+    # alongside the older type-relative metadata so ffprobe streams which are
+    # present in a clip but not selected by the playlist can be discarded
+    # instead of becoming unlabelled subtitle tracks.
+    stream_pid_metadata: tuple[tuple[str, str, int, int], ...] = ()
     chapters: tuple[PlaylistChapter, ...] = ()
+    source_items: tuple[PlaylistItem, ...] = ()
+    incomplete_clips: tuple[str, ...] = ()
+    normalization_note: str | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -399,58 +480,54 @@ class Playlist:
     @property
     def looping_period(self) -> int | None:
         """Return the repeated play-item cycle length, if this is a loop."""
-        item_count = len(self.items)
-        if item_count < 3:
-            return None
-
-        # A menu playlist can repeat one item or a short sequence of items
-        # many times.  Require at least three cycles and near-perfect
-        # periodicity so ordinary multi-segment feature playlists are not
-        # discarded merely because they reuse a clip.
-        for period in range(1, item_count // 3 + 1):
-            cycle_count = item_count / period
-            if cycle_count < 3:
-                continue
-            matches = sum(
-                self.items[index] == self.items[index % period]
-                for index in range(item_count)
-            )
-            if matches / item_count < 0.95:
-                continue
-            cycle_duration = sum(item.duration_seconds for item in self.items[:period])
-            if cycle_duration > 0 and self.duration_seconds / cycle_duration >= 3:
-                return period
-        return None
+        return _looping_period(self.source_items or self.items)
 
     @property
     def is_looping(self) -> bool:
         return self.looping_period is not None
 
+    @property
+    def is_complete(self) -> bool:
+        return not self.incomplete_clips
 
-def parse_mpls_stream(
+    @property
+    def has_attached_loop(self) -> bool:
+        return bool(self.normalization_note and self.normalization_note.startswith("retained attached"))
+
+    @property
+    def main_selection_duration(self) -> float:
+        """Duration used to identify a feature before loop-noise removal."""
+        if self.has_attached_loop and self.source_items:
+            return sum(item.duration_seconds for item in self.source_items)
+        return self.duration_seconds
+
+
+def _parse_mpls_stream_entry(
     data: bytes,
     cursor: int,
     end: int,
     stream_type: str,
-) -> tuple[tuple[str, str, int] | None, int]:
-    """Read one MPLS STN stream entry and return its language metadata."""
+) -> tuple[tuple[str, str, int] | None, int, int | None]:
+    """Read one MPLS STN stream entry, including its transport-stream PID."""
     if cursor >= end:
-        return None, end
+        return None, end, None
     descriptor_length = data[cursor]
     descriptor_end = cursor + 1 + descriptor_length
     if descriptor_length < 1 or descriptor_end > end:
-        return None, end
+        return None, end, None
 
     # The first descriptor contains stream type/PID information.  The second
     # descriptor contains the coding type and, for audio/subtitle streams, the
     # three-letter ISO 639 language code.
     if descriptor_end >= end:
-        return None, end
+        return None, end, None
     coding_length = data[descriptor_end]
     coding_start = descriptor_end + 1
     coding_end = coding_start + coding_length
     if coding_length < 1 or coding_end > end:
-        return None, end
+        return None, end, None
+
+    pid = be16(data, cursor + 2) if descriptor_length >= 3 else None
 
     coding_type = data[coding_start]
     language = ""
@@ -480,7 +557,18 @@ def parse_mpls_stream(
             "ascii", "replace"
         ).strip("\x00 ")
 
-    return (stream_type, language, coding_type), coding_end
+    return (stream_type, language, coding_type), coding_end, pid
+
+
+def parse_mpls_stream(
+    data: bytes,
+    cursor: int,
+    end: int,
+    stream_type: str,
+) -> tuple[tuple[str, str, int] | None, int]:
+    """Read one MPLS STN stream entry and return its language metadata."""
+    stream, next_cursor, _pid = _parse_mpls_stream_entry(data, cursor, end, stream_type)
+    return stream, next_cursor
 
 
 def parse_stn_stream_metadata(
@@ -514,6 +602,40 @@ def parse_stn_stream_metadata(
                 return metadata
             metadata.append(stream)
 
+    return metadata
+
+
+def parse_stn_stream_pid_metadata(
+    data: bytes,
+    stn_start: int,
+    item_end: int,
+) -> list[tuple[str, str, int, int]]:
+    """Parse STN stream language metadata together with each stream PID."""
+    if stn_start + 16 > item_end:
+        return []
+    stn_length = be16(data, stn_start)
+    stn_end = min(item_end, stn_start + 2 + stn_length)
+    if stn_end < stn_start + 16:
+        return []
+
+    num_video = data[stn_start + 4]
+    num_audio = data[stn_start + 5]
+    num_pg = data[stn_start + 6]
+    num_pip_pg = data[stn_start + 10]
+    cursor = stn_start + 16
+    metadata: list[tuple[str, str, int, int]] = []
+    for stream_type, count in (
+        ("video", num_video),
+        ("audio", num_audio),
+        ("subtitle", num_pg + num_pip_pg),
+    ):
+        for _ in range(count):
+            stream, cursor, pid = _parse_mpls_stream_entry(
+                data, cursor, stn_end, stream_type
+            )
+            if stream is None or pid is None:
+                return metadata
+            metadata.append((*stream, pid))
     return metadata
 
 
@@ -589,6 +711,8 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
     audio_counts: list[int] = []
     stream_metadata: list[tuple[str, str, int]] = []
     stream_metadata_counts: Counter[tuple[str, str, int]] = Counter()
+    stream_pid_metadata: list[tuple[str, str, int, int]] = []
+    stream_pid_metadata_counts: Counter[tuple[str, str, int, int]] = Counter()
     for index in range(item_count):
         if cursor + 2 > playlist_end:
             raise RuntimeError(f"MPLS play item {index} is truncated: {name}")
@@ -625,6 +749,13 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
                 if additional > 0:
                     stream_metadata.extend([metadata] * additional)
                     stream_metadata_counts[metadata] = count
+            item_pid_metadata = parse_stn_stream_pid_metadata(data, stn_start, item_end)
+            item_pid_counts = Counter(item_pid_metadata)
+            for metadata, count in item_pid_counts.items():
+                additional = count - stream_pid_metadata_counts[metadata]
+                if additional > 0:
+                    stream_pid_metadata.extend([metadata] * additional)
+                    stream_pid_metadata_counts[metadata] = count
         cursor = item_end
 
     audio_stream_count = max(audio_counts) if audio_counts else -1
@@ -633,6 +764,7 @@ def parse_mpls(data: bytes, name: str = "") -> Playlist:
         items=tuple(items),
         audio_stream_count=audio_stream_count,
         stream_metadata=tuple(stream_metadata),
+        stream_pid_metadata=tuple(stream_pid_metadata),
         chapters=parse_mpls_chapters(data, mark_pos, items),
     )
 
@@ -744,7 +876,12 @@ class RemoteRangeReader:
         # available whenever the configured size fits within this cap.
         cache_memory_cap = 256 * 1024 * 1024
         memory_limit = max(1, cache_memory_cap // self.range_size)
-        self.cache_limit = max(1, min(workers + prefetch + 2, memory_limit))
+        # ffprobe can seek backwards while inspecting an MPEG-TS timestamp
+        # index.  Keeping only the current chunk plus prefetch chunks causes
+        # the same remote ranges to be downloaded over and over (especially
+        # with ``--workers 1``).  A small bounded history avoids that without
+        # turning the reader into a full-ISO cache.
+        self.cache_limit = max(1, min(max(workers + prefetch + 2, 32), memory_limit))
         self._executor = ThreadPoolExecutor(
             max_workers=self.workers,
             thread_name_prefix="remote-bluray-range",
@@ -800,7 +937,10 @@ class RemoteRangeReader:
                         print(f"Remote Range: {start}-{end} -> {len(data):,} bytes")
                     return data
 
-                retryable = response.status_code == 429 or response.status_code >= 500
+                # The 115/Alist redirect chain can intermittently return 403
+                # for an otherwise valid Range.  Re-entering through the
+                # source URL on the next attempt obtains a fresh signed URL.
+                retryable = response.status_code in {403, 429} or response.status_code >= 500
                 if not retryable:
                     raise RuntimeError(f"Range request failed: HTTP {response.status_code}")
                 last_error = IOError(f"Range request failed: HTTP {response.status_code}")
@@ -957,6 +1097,34 @@ class UdfFile:
     def size(self) -> int:
         return self.entry["length"]
 
+    @property
+    def physical_end(self) -> int:
+        """Return the first byte after the furthest physical extent."""
+        ends = []
+        for ad in self.entry["ads"]:
+            if ad["kind"] != 0:
+                continue
+            start = self.image.partition_base(ad["partition"]) + ad["lba"] * BLOCK_SIZE
+            ends.append(start + ad["length"])
+        return max(ends, default=0)
+
+    @property
+    def is_complete(self) -> bool:
+        """Whether every recorded physical extent fits inside the ISO.
+
+        A truncated ISO can still contain a perfectly readable UDF directory
+        and MPLS table.  Without this check ffprobe receives a virtual file
+        that claims to be tens of gigabytes long, then keeps seeking after
+        the real EOF while the Range reader repeatedly serves short reads.
+        """
+        for ad in self.entry["ads"]:
+            if ad["kind"] != 0:
+                continue
+            start = self.image.partition_base(ad["partition"]) + ad["lba"] * BLOCK_SIZE
+            if start < 0 or start + ad["length"] > self.image.remote.size:
+                return False
+        return True
+
     def _locate(self, offset: int) -> tuple[dict, int]:
         if offset < 0 or offset >= self.size:
             raise ValueError(f"Offset outside {self.path}: {offset}")
@@ -977,7 +1145,13 @@ class UdfFile:
             available = min(size, ad["length"] - within)
             if ad["kind"] == 0:
                 absolute = self.image.partition_base(ad["partition"]) + ad["lba"] * BLOCK_SIZE + within
-                output.extend(self.image.remote.read_range(absolute, available))
+                data = self.image.remote.read_range(absolute, available)
+                if len(data) != available:
+                    raise IOError(
+                        f"Short physical read in {self.path}: got {len(data):,}, "
+                        f"expected {available:,} at {absolute:,}"
+                    )
+                output.extend(data)
             elif ad["kind"] in (1, 2):
                 output.extend(b"\x00" * available)
             else:
@@ -1026,6 +1200,7 @@ class RemoteUdfImage:
         self.root_icb = None
         self._entry_cache: dict[tuple[int, int], dict] = {}
         self._directory_cache: dict[tuple[int, tuple], list[dict]] = {}
+        self._playlist_cache: list[Playlist] | None = None
         self._parse_volume()
 
     def partition_base(self, partition: int) -> int:
@@ -1184,6 +1359,8 @@ class RemoteUdfImage:
         return sorted(candidates, key=lambda value: value[1].size, reverse=True)
 
     def playlist_candidates(self) -> list[Playlist]:
+        if self._playlist_cache is not None:
+            return list(self._playlist_cache)
         playlists = []
         stream_names = {
             entry["name"].casefold()
@@ -1191,6 +1368,7 @@ class RemoteUdfImage:
             if not entry["directory"]
         }
         clip_size_cache: dict[str, int] = {}
+        clip_complete_cache: dict[str, bool] = {}
         missing_clips: set[str] = set()
         for item in self.list_dir("/BDMV/PLAYLIST"):
             name = item["name"]
@@ -1199,6 +1377,7 @@ class RemoteUdfImage:
             path = f"/BDMV/PLAYLIST/{name}"
             playlist = parse_mpls(self.find(path).read_all(), name=name)
             clip_sizes = {}
+            incomplete_clips: set[str] = set()
             missing_clip = False
             for playlist_item in playlist.items:
                 if playlist_item.clip_id in clip_sizes:
@@ -1208,6 +1387,8 @@ class RemoteUdfImage:
                     break
                 if playlist_item.clip_id in clip_size_cache:
                     clip_sizes[playlist_item.clip_id] = clip_size_cache[playlist_item.clip_id]
+                    if not clip_complete_cache.get(playlist_item.clip_id, True):
+                        incomplete_clips.add(playlist_item.clip_id)
                     continue
                 clip_name = f"{playlist_item.clip_id}.m2ts"
                 if clip_name.casefold() not in stream_names:
@@ -1217,11 +1398,13 @@ class RemoteUdfImage:
                     missing_clip = True
                     break
                 try:
-                    clip_size = self.find(
-                        f"/BDMV/STREAM/{clip_name}"
-                    ).size
+                    clip_file = self.find(f"/BDMV/STREAM/{clip_name}")
+                    clip_size = clip_file.size
                     clip_size_cache[playlist_item.clip_id] = clip_size
+                    clip_complete_cache[playlist_item.clip_id] = clip_file.is_complete
                     clip_sizes[playlist_item.clip_id] = clip_size
+                    if not clip_file.is_complete:
+                        incomplete_clips.add(playlist_item.clip_id)
                 except FileNotFoundError:
                     # Some authoring tools leave short or obsolete MPLS
                     # entries behind after removing their M2TS clips.  Such a
@@ -1232,19 +1415,32 @@ class RemoteUdfImage:
                     break
             if missing_clip:
                 continue
-            size_bytes = sum(clip_sizes.get(item.clip_id, 0) for item in playlist.items)
+            source_items = tuple(playlist.items)
+            normalized_items, normalization_note = normalize_playlist_items(source_items)
+            size_bytes = sum(clip_sizes.get(item.clip_id, 0) for item in normalized_items)
+            normalized_duration = sum(item.duration_seconds for item in normalized_items)
+            chapters = tuple(
+                chapter
+                for chapter in playlist.chapters
+                if chapter.time_seconds <= normalized_duration + 0.001
+            )
             playlists.append(
                 Playlist(
                     name=playlist.name,
-                    items=playlist.items,
+                    items=normalized_items,
                     size_bytes=size_bytes,
                     unique_size_bytes=sum(clip_sizes.values()),
                     audio_stream_count=playlist.audio_stream_count,
                     stream_metadata=playlist.stream_metadata,
-                    chapters=playlist.chapters,
+                    stream_pid_metadata=playlist.stream_pid_metadata,
+                    chapters=chapters,
+                    source_items=source_items,
+                    incomplete_clips=tuple(sorted(incomplete_clips)),
+                    normalization_note=normalization_note,
                 )
             )
-        return sorted(playlists, key=lambda playlist: playlist.name.casefold())
+        self._playlist_cache = sorted(playlists, key=lambda playlist: playlist.name.casefold())
+        return list(self._playlist_cache)
 
 
 class VirtualFileServer:
@@ -1407,9 +1603,25 @@ def choose_playlist(image: RemoteUdfImage, requested: str | None) -> Playlist:
         wanted = normalize_playlist_name(requested).casefold()
         for playlist in playlists:
             if playlist.name.casefold() == wanted:
-                return playlist
-        raise FileNotFoundError(f"MPLS playlist not found: {requested}")
-    return max(playlists, key=lambda playlist: playlist.duration_seconds)
+                selected = playlist
+                break
+        else:
+            raise FileNotFoundError(f"MPLS playlist not found: {requested}")
+        if not selected.is_complete:
+            clips = ", ".join(f"{clip}.m2ts" for clip in selected.incomplete_clips)
+            raise RuntimeError(
+                f"Playlist {selected.name} references data beyond the ISO EOF "
+                f"(incomplete M2TS: {clips or 'unknown'}; ISO size={image.remote.size:,} bytes)"
+            )
+        return selected
+    selected = main_playlist(playlists)
+    if not selected.is_complete:
+        clips = ", ".join(f"{clip}.m2ts" for clip in selected.incomplete_clips)
+        raise RuntimeError(
+            f"Main playlist {selected.name} references data beyond the ISO EOF "
+            f"(incomplete M2TS: {clips or 'unknown'}; ISO size={image.remote.size:,} bytes)"
+        )
+    return selected
 
 
 def format_duration(seconds: float) -> str:
@@ -1455,18 +1667,37 @@ def ffmpeg_seconds(timestamp: int) -> str:
 def main_playlist(playlists: list[Playlist]) -> Playlist:
     if not playlists:
         raise RuntimeError("No valid .mpls playlists found in /BDMV/PLAYLIST")
-    # Count each referenced M2TS once for main detection.  Some discs contain
-    # fake/looping playlists that repeat one short clip hundreds of times;
-    # counting every repetition would incorrectly make those playlists the
-    # largest title.
+    # Ignore pure menu loops, but keep a feature playlist with an attached
+    # repeated tail in the candidate set.  Its raw duration is useful for
+    # recognizing the title; its normalized items are used for probing.
+    non_looping = [playlist for playlist in playlists if not playlist.is_looping]
+    candidates = non_looping or playlists
     return max(
-        playlists,
+        candidates,
         key=lambda playlist: (
-            playlist.unique_size_bytes,
+            playlist.main_selection_duration,
             playlist.size_bytes,
-            playlist.duration_seconds,
+            playlist.unique_size_bytes,
         ),
     )
+
+
+def playlist_sample_point(playlist: Playlist, sample_seconds: float) -> tuple[PlaylistItem, float]:
+    """Choose a clip and local timestamp around the playlist midpoint."""
+    if not playlist.items:
+        raise RuntimeError(f"Playlist has no primary play items: {playlist.name}")
+    total = playlist.duration_seconds
+    target = total / 2.0
+    half_window = max(0.0, sample_seconds / 2.0)
+    timeline = 0.0
+    for item in playlist.items:
+        duration = item.duration_seconds
+        if target <= timeline + duration or item is playlist.items[-1]:
+            local = max(0.0, target - timeline - half_window)
+            local = min(local, max(0.0, duration - 0.05))
+            return item, item.in_time / 45000.0 + local
+        timeline += duration
+    return playlist.items[-1], playlist.items[-1].in_time / 45000.0
 
 
 def select_playlists(
@@ -1514,7 +1745,7 @@ def select_playlists(
                 continue
             if (
                 playlist.duration_seconds >= threshold
-                and playlist.duration_seconds <= main.duration_seconds
+                and playlist.main_selection_duration <= main.main_selection_duration
             ):
                 selected.append(playlist)
         return sorted(selected, key=lambda playlist: (-playlist.size_bytes, playlist.name.casefold()))
@@ -1532,6 +1763,13 @@ def playlist_summary(playlist: Playlist) -> str:
     )
 
 
+def temporary_directory(prefix: str) -> tempfile.TemporaryDirectory:
+    """Create short-lived ffconcat files inside the workspace, not /tmp."""
+    root = Path(os.environ.get("REMOTE_BLURAY_TMPDIR", Path.cwd() / ".remote-bluray-tmp"))
+    root.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=str(root))
+
+
 @contextmanager
 def virtual_input(
     image: RemoteUdfImage,
@@ -1545,7 +1783,7 @@ def virtual_input(
         if not playlist.items:
             raise RuntimeError(f"Playlist has no primary play items: {playlist.name}")
 
-        with tempfile.TemporaryDirectory(prefix="remote_bluray_") as temp_dir:
+        with temporary_directory(prefix="remote_bluray_") as temp_dir:
             concat_path = Path(temp_dir) / f"{Path(playlist.name).stem}.ffconcat"
             lines = ["ffconcat version 1.0"]
             for item in playlist.items:
@@ -1582,6 +1820,34 @@ def virtual_input(
     name, file = choose_stream(image, stream_name)
     path = f"/BDMV/STREAM/{name}"
     yield ["-i", server.file_url(path)], f"Stream: {name} ({file.size:,} bytes)"
+
+
+@contextmanager
+def virtual_sample_input(
+    image: RemoteUdfImage,
+    server: VirtualFileServer,
+    playlist: Playlist,
+    sample_seconds: float,
+) -> Iterator[tuple[list[str], str]]:
+    """Expose one middle clip for a bounded partial metadata probe.
+
+    Feeding an entire MPLS through the concat demuxer makes ffprobe seek over
+    every play item, even with ``-read_intervals``.  A representative M2TS at
+    the playlist midpoint gives the same stream metadata while keeping HTTP
+    Range traffic proportional to the requested sample window.
+    """
+    item, clip_offset = playlist_sample_point(playlist, sample_seconds)
+    path = f"/BDMV/STREAM/{item.clip_id}.m2ts"
+    clip = image.find(path)
+    if not clip.is_complete:
+        raise RuntimeError(
+            f"Sample clip {item.clip_id}.m2ts extends beyond the ISO EOF "
+            f"(ISO size={image.remote.size:,} bytes)"
+        )
+    yield (
+        ["-i", server.file_url(path)],
+        f"Middle sample: {item.clip_id}.m2ts at {clip_offset:.3f}s",
+    )
 
 
 def output_paths(output_name: str, playlists: list[Playlist], kind: str) -> list[Path]:
@@ -1643,7 +1909,7 @@ def probe_stream_metadata(input_args: list[str]) -> list[dict]:
         "-v",
         "error",
         "-show_entries",
-        "stream=codec_type,codec_name,profile:stream_tags=language",
+        "stream=id,codec_type,codec_name,profile:stream_tags=language",
         "-of",
         "json",
     ] + input_args
@@ -1657,7 +1923,7 @@ def probe_stream_metadata(input_args: list[str]) -> list[dict]:
     return list(payload.get("streams", []))
 
 
-INFO_PARTIAL_SECONDS = 100.0
+INFO_PARTIAL_SECONDS = 10.0
 DEFAULT_SCREENSHOT_SKIP_START_SECONDS = 60.0
 
 
@@ -1665,6 +1931,7 @@ def probe_media_info(
     input_args: list[str],
     scan_mode: str = "full",
     partial_seconds: float = INFO_PARTIAL_SECONDS,
+    sample_start_seconds: float = 0.0,
 ) -> dict:
     """Probe a playlist timeline for the detailed ``info`` report.
 
@@ -1676,15 +1943,25 @@ def probe_media_info(
         "-hide_banner",
         "-v",
         "error",
+        "-probesize",
+        "8M" if scan_mode == "partial" else "16M",
+        "-analyzeduration",
+        "2M" if scan_mode == "partial" else "5M",
         "-show_streams",
-        "-show_format",
         "-of",
         "json",
     ]
+    if scan_mode == "full":
+        command.insert(command.index("-of"), "-show_format")
     if scan_mode == "partial":
         if partial_seconds <= 0:
             raise ValueError("partial scan duration must be greater than zero")
-        command.extend(["-read_intervals", f"%+{partial_seconds:g}"])
+        interval = (
+            f"{sample_start_seconds:g}%+{partial_seconds:g}"
+            if sample_start_seconds > 0
+            else f"%+{partial_seconds:g}"
+        )
+        command.extend(["-read_intervals", interval])
     elif scan_mode != "full":
         raise ValueError(f"Unknown info scan mode: {scan_mode}")
     command.extend(input_args)
@@ -1710,6 +1987,7 @@ def probe_packet_stats(
     input_args: list[str],
     scan_mode: str = "full",
     partial_seconds: float = INFO_PARTIAL_SECONDS,
+    sample_start_seconds: float = 0.0,
 ) -> dict[int, int]:
     """Sum demuxed packet bytes by stream without buffering full output.
 
@@ -1722,6 +2000,10 @@ def probe_packet_stats(
         "-hide_banner",
         "-v",
         "error",
+        "-probesize",
+        "16M",
+        "-analyzeduration",
+        "5M",
         "-show_packets",
         "-show_entries",
         "packet=stream_index,size",
@@ -1731,7 +2013,12 @@ def probe_packet_stats(
     if scan_mode == "partial":
         if partial_seconds <= 0:
             raise ValueError("partial scan duration must be greater than zero")
-        command.extend(["-read_intervals", f"%+{partial_seconds:g}"])
+        interval = (
+            f"{sample_start_seconds:g}%+{partial_seconds:g}"
+            if sample_start_seconds > 0
+            else f"%+{partial_seconds:g}"
+        )
+        command.extend(["-read_intervals", interval])
     elif scan_mode != "full":
         raise ValueError(f"Unknown info scan mode: {scan_mode}")
     command.extend(input_args)
@@ -1787,7 +2074,193 @@ LANGUAGE_NAMES = {
     "ita": "Italian",
     "kor": "Korean",
     "rus": "Russian",
+    "ara": "Arabic",
+    "heb": "Hebrew",
+    "ell": "Greek",
+    "tha": "Thai",
 }
+
+LANGUAGE_ALIASES = {
+    "chi": "zho",
+    "zho": "zho",
+    "cmn": "zho",
+    "zh": "zho",
+    "zh-cn": "zho",
+    "zh-hans": "zho",
+    "cn": "zho",
+    "chs": "zho",
+    "sc": "zho",
+    "cht": "zho",
+    "tc": "zho",
+    "chinese": "zho",
+    "中文": "zho",
+    "简中": "zho",
+    "简体": "zho",
+    "繁中": "zho",
+    "繁体": "zho",
+    "繁體": "zho",
+    "eng": "eng",
+    "en": "eng",
+    "english": "eng",
+    "英文": "eng",
+    "fra": "fra",
+    "fre": "fra",
+    "fr": "fra",
+    "french": "fra",
+    "法文": "fra",
+    "deu": "deu",
+    "ger": "deu",
+    "de": "deu",
+    "german": "deu",
+    "德文": "deu",
+    "spa": "spa",
+    "es": "spa",
+    "spanish": "spa",
+    "西班牙语": "spa",
+    "ita": "ita",
+    "it": "ita",
+    "italian": "ita",
+    "意大利语": "ita",
+    "jpn": "jpn",
+    "jap": "jpn",
+    "ja": "jpn",
+    "jp": "jpn",
+    "japanese": "jpn",
+    "日文": "jpn",
+    "日语": "jpn",
+    "kor": "kor",
+    "ko": "kor",
+    "korean": "kor",
+    "韩文": "kor",
+    "韩语": "kor",
+    "rus": "rus",
+    "ru": "rus",
+    "russian": "rus",
+    "俄文": "rus",
+    "ara": "ara",
+    "ar": "ara",
+    "arabic": "ara",
+    "阿拉伯语": "ara",
+    "ell": "ell",
+    "gre": "ell",
+    "el": "ell",
+    "greek": "ell",
+    "希腊语": "ell",
+    "tha": "tha",
+    "th": "tha",
+    "thai": "tha",
+    "泰语": "tha",
+}
+
+
+def normalize_language_code(value: str | None) -> str:
+    """Normalize common ISO-639 aliases to the three-letter Emby code."""
+    normalized = str(value or "").strip().casefold().replace("_", "-")
+    return LANGUAGE_ALIASES.get(normalized, normalized)
+
+
+def infer_language_from_name(value: str | None) -> str:
+    """Infer a language only from explicit filename/title markers."""
+    text = str(value or "").strip().casefold().replace("_", "-")
+    if not text:
+        return ""
+    # Match longer phrases first so ``zh-hans`` is not reduced to ``zh``.
+    for marker, language in sorted(LANGUAGE_ALIASES.items(), key=lambda pair: -len(pair[0])):
+        if not marker:
+            continue
+        if any(ord(char) > 127 for char in marker):
+            if marker in text:
+                return language
+            continue
+        pattern = rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])"
+        if re.search(pattern, text):
+            return language
+    return ""
+
+
+def infer_language_from_text(value: str | None) -> str:
+    """Infer languages with unambiguous script signals from subtitle text."""
+    text = str(value or "")
+    if not text:
+        return ""
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "jpn"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "kor"
+    if re.search(r"[\u0e00-\u0e7f]", text):
+        return "tha"
+    if re.search(r"[\u0600-\u06ff]", text):
+        return "ara"
+    if re.search(r"[\u0590-\u05ff]", text):
+        return "heb"
+    if len(re.findall(r"[\u3400-\u9fff]", text)) >= 3:
+        return "zho"
+
+    # Latin-script subtitles are not safely distinguishable by Unicode alone.
+    # Only label English when several high-signal function words occur; an
+    # unrecognised Latin subtitle remains blank instead of being mislabelled.
+    words = set(re.findall(r"[a-z]+", text.casefold()))
+    if len(words) >= 8 and len(words & {"the", "and", "you", "that", "this", "with", "not", "for"}) >= 2:
+        return "eng"
+    return ""
+
+
+def infer_subtitle_language(
+    stream: dict,
+    *,
+    source_name: str = "",
+    text: str = "",
+) -> str:
+    """Return an explicit stream/name/text language hint, if one is safe."""
+    tags = stream.get("tags") or {}
+    for value in (
+        tags.get("language"),
+        tags.get("LANGUAGE"),
+        stream.get("language"),
+        stream.get("Language"),
+    ):
+        if value:
+            normalized = normalize_language_code(str(value))
+            if normalized not in {"und", "unknown", "unk", "n/a", "none"}:
+                return normalized
+    for value in (tags.get("title"), tags.get("TITLE"), stream.get("title"), source_name):
+        language = infer_language_from_name(value)
+        if language:
+            return language
+    return infer_language_from_text(text)
+
+
+def enrich_subtitle_languages(
+    streams: list[dict],
+    *,
+    source_name: str = "",
+    text_by_index: dict[int, str] | None = None,
+) -> list[dict]:
+    """Fill missing subtitle tags using conservative metadata/text hints."""
+    text_by_index = text_by_index or {}
+    enriched: list[dict] = []
+    for stream in streams:
+        if str(stream.get("codec_type") or "").casefold() != "subtitle":
+            enriched.append(stream)
+            continue
+        try:
+            index = int(stream.get("index"))
+        except (TypeError, ValueError):
+            index = -1
+        language = infer_subtitle_language(
+            stream,
+            source_name=source_name,
+            text=text_by_index.get(index, ""),
+        )
+        if not language or stream_language(stream):
+            enriched.append(stream)
+            continue
+        enriched_stream = dict(stream)
+        tags = dict(stream.get("tags") or {})
+        tags["language"] = language
+        enriched_stream["tags"] = tags
+        enriched.append(enriched_stream)
+    return enriched
 
 CHINESE_LANGUAGE_CODES = {
     "chi",
@@ -1856,7 +2329,10 @@ def info_display_codec(stream: dict) -> str:
 
 def stream_language(stream: dict) -> str | None:
     tags = stream.get("tags") or {}
-    return tags.get("language") or tags.get("LANGUAGE")
+    value = tags.get("language") or tags.get("LANGUAGE")
+    if str(value or "").strip().casefold() in {"und", "unknown", "unk", "n/a", "none"}:
+        return None
+    return value
 
 
 def numeric_value(value) -> float | None:
@@ -2242,9 +2718,10 @@ def format_emby_json(
     media_info: dict,
     scan_mode: str,
     partial_seconds: float,
+    sample_start_seconds: float = 0.0,
 ) -> list[dict]:
     """Build an Emby-style technical media-info payload for the main title."""
-    streams = add_playlist_languages(playlist, list(media_info.get("streams", [])))
+    streams = playlist_streams(playlist, list(media_info.get("streams", [])))
     chapters = [
         {
             "StartPositionTicks": int(round(chapter.time_seconds * 10_000_000)),
@@ -2283,6 +2760,7 @@ def format_emby_json(
                 "ScanDurationSeconds": playlist.duration_seconds
                 if scan_mode == "full"
                 else min(partial_seconds, playlist.duration_seconds),
+                "ScanPositionSeconds": sample_start_seconds if scan_mode == "partial" else 0.0,
             },
         }
     ]
@@ -2300,10 +2778,24 @@ def stream_signature(stream: dict) -> tuple[str, str, str, str]:
 
 
 def add_playlist_languages(playlist: Playlist, streams: list[dict]) -> list[dict]:
-    """Fill missing ffprobe language tags from the MPLS stream table."""
+    """Fill missing ffprobe language tags from the MPLS stream table.
+
+    Recent ffprobe versions expose the MPEG-TS PID as ``stream.id``.  Use it
+    when available because a raw M2TS can contain subtitle/audio PIDs that are
+    not part of the selected MPLS.  Positional matching remains the fallback
+    for older ffprobe output and synthetic callers.
+    """
     languages: dict[str, list[str]] = {"video": [], "audio": [], "subtitle": []}
     for stream_type, language, _coding_type in playlist.stream_metadata:
         languages.setdefault(stream_type, []).append(language)
+
+    pid_languages: dict[tuple[str, int], str] = {}
+    pid_known: set[tuple[str, int]] = set()
+    for stream_type, language, _coding_type, pid in playlist.stream_pid_metadata:
+        key = (stream_type, pid)
+        pid_known.add(key)
+        if language and key not in pid_languages:
+            pid_languages[key] = language
 
     positions: Counter[str] = Counter()
     enriched = []
@@ -2312,7 +2804,22 @@ def add_playlist_languages(playlist: Playlist, streams: list[dict]) -> list[dict
         position = positions[stream_type]
         positions[stream_type] += 1
         tags = stream.get("tags") or {}
-        existing = tags.get("language") or tags.get("LANGUAGE")
+        existing = stream_language(stream)
+        pid = stream_transport_pid(stream)
+        pid_key = (stream_type, pid) if pid is not None else None
+        if not existing and pid_key in pid_known:
+            language = pid_languages.get(pid_key, "")
+            if language:
+                enriched_stream = dict(stream)
+                enriched_tags = dict(tags)
+                enriched_tags["language"] = language
+                enriched_stream["tags"] = enriched_tags
+                enriched.append(enriched_stream)
+                continue
+            # The playlist explicitly has this PID but no language code.  Do
+            # not borrow a neighbouring stream's language by position.
+            enriched.append(stream)
+            continue
         language_values = languages.get(stream_type, [])
         if existing or position >= len(language_values) or not language_values[position]:
             enriched.append(stream)
@@ -2323,6 +2830,44 @@ def add_playlist_languages(playlist: Playlist, streams: list[dict]) -> list[dict
         enriched_stream["tags"] = enriched_tags
         enriched.append(enriched_stream)
     return enriched
+
+
+def stream_transport_pid(stream: dict) -> int | None:
+    """Return an ffprobe MPEG-TS PID, accepting decimal and ``0x`` forms."""
+    value = stream.get("id")
+    if value is None:
+        value = (stream.get("tags") or {}).get("id")
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        return int(text, 0) if text.lower().startswith("0x") else int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def playlist_streams(playlist: Playlist, streams: list[dict]) -> list[dict]:
+    """Enrich streams and remove clip-local tracks not selected by the MPLS."""
+    enriched = add_playlist_languages(playlist, streams)
+    if not playlist.stream_pid_metadata:
+        return enriched
+
+    selected_pids: dict[str, set[int]] = {}
+    for stream_type, _language, _coding_type, pid in playlist.stream_pid_metadata:
+        selected_pids.setdefault(stream_type, set()).add(pid)
+
+    filtered: list[dict] = []
+    for stream in enriched:
+        stream_type = str(stream.get("codec_type", "")).casefold()
+        pid = stream_transport_pid(stream)
+        allowed = selected_pids.get(stream_type)
+        # If ffprobe did not expose a PID, retain the stream rather than
+        # risking data loss.  With a PID, however, only the MPLS-selected
+        # streams belong in the Emby MediaStreams list.
+        if allowed and pid is not None and pid not in allowed:
+            continue
+        filtered.append(stream)
+    return filtered
 
 
 def playlist_m2ts_names(playlist: Playlist) -> list[tuple[str, int]]:
@@ -2342,7 +2887,7 @@ def playlist_stream_metadata(
         if clip_name not in cache:
             path = f"/BDMV/STREAM/{clip_name}.m2ts"
             cache[clip_name] = probe_stream_metadata(["-i", server.file_url(path)])
-        streams = add_playlist_languages(playlist, cache[clip_name])
+        streams = playlist_streams(playlist, cache[clip_name])
         if not merged:
             merged.extend(streams)
             continue
@@ -2435,6 +2980,7 @@ def format_info_report(
     media_info: dict,
     scan_mode: str,
     partial_seconds: float = INFO_PARTIAL_SECONDS,
+    sample_start_seconds: float = 0.0,
 ) -> str:
     label = (image.volume_id or "-").strip() or "-"
     protection = "AACS" if udf_path_exists(image, "/AACS") else "None detected"
@@ -2445,9 +2991,9 @@ def format_info_report(
     scan_label = (
         "Complete file"
         if scan_mode == "full"
-        else f"First {partial_seconds:g} seconds only"
+        else f"Middle sample: {partial_seconds:g} seconds at {sample_start_seconds:g}s"
     )
-    streams = add_playlist_languages(playlist, list(media_info.get("streams", [])))
+    streams = playlist_streams(playlist, list(media_info.get("streams", [])))
 
     lines = [
         "DISC INFO:",
@@ -2508,7 +3054,7 @@ def choose_chinese_subtitle_stream(
     if mode != "auto":
         raise ValueError(f"Unknown screenshot subtitle mode: {mode}")
 
-    enriched_streams = add_playlist_languages(playlist, streams)
+    enriched_streams = playlist_streams(playlist, streams)
     subtitle_index = 0
     for stream in enriched_streams:
         if stream.get("codec_type") != "subtitle":
@@ -2668,12 +3214,21 @@ def format_playlist_details(
     server: VirtualFileServer,
     cache: dict[str, list[dict]],
 ) -> str:
-    streams = playlist_stream_metadata(playlist, server, cache)
     m2ts = []
     for name, count in playlist_m2ts_names(playlist):
         suffix = f" x{count}" if count > 1 else ""
         m2ts.append(f"{name}{suffix}")
     lines = [playlist_summary(playlist)]
+    if playlist.normalization_note:
+        lines.append(f"  Compatibility: {playlist.normalization_note}")
+    if not playlist.is_complete:
+        clips = ", ".join(f"{clip}.m2ts" for clip in playlist.incomplete_clips)
+        lines.append(
+            f"  Status: INCOMPLETE (data beyond ISO EOF: {clips or 'unknown'})"
+        )
+        lines.extend(format_labeled_values("M2TS", m2ts))
+        return "\n".join(lines)
+    streams = playlist_stream_metadata(playlist, server, cache)
     lines.extend(format_labeled_values("M2TS", m2ts))
     lines.extend(format_stream_group("Video", streams, "video"))
     lines.extend(format_stream_group("Audio", streams, "audio"))
@@ -2713,10 +3268,13 @@ def collect_info_result(args, image: RemoteUdfImage, progress_file=None) -> dict
         partial_seconds = parse_duration(args.scan_duration)
         if partial_seconds <= 0:
             raise ValueError("partial scan duration must be greater than zero")
+    sample_start_seconds = 0.0
+    if args.scan == "partial":
+        _sample_item, sample_start_seconds = playlist_sample_point(playlist, partial_seconds)
     scan_label = (
         "complete main playlist"
         if args.scan == "full"
-        else f"first {partial_seconds:g} seconds of the main playlist"
+        else f"middle {partial_seconds:g} seconds of the main playlist"
     )
     screenshot_outputs: list[Path] = []
     screenshot_duration = (
@@ -2729,11 +3287,33 @@ def collect_info_result(args, image: RemoteUdfImage, progress_file=None) -> dict
         screenshot_skip_start = parse_duration(args.screenshot_skip_start)
 
     with VirtualFileServer(image, verbose=args.verbose) as server:
-        with virtual_input(image, server, None, playlist.name) as selected:
+        input_context = (
+            virtual_sample_input(image, server, playlist, partial_seconds)
+            if args.scan == "partial"
+            else virtual_input(image, server, None, playlist.name)
+        )
+        with input_context as selected:
             input_args, _label = selected
             print(f"Scanning {playlist.name} ({scan_label})...", file=progress_file, flush=True)
-            media_info = probe_media_info(input_args, args.scan, partial_seconds)
-            packet_sizes = probe_packet_stats(input_args, args.scan, partial_seconds)
+            media_info = probe_media_info(
+                input_args,
+                args.scan,
+                partial_seconds,
+                sample_start_seconds,
+            )
+            # The partial pass intentionally avoids a second packet walk.
+            # The playlist supplies the overall bitrate, while a second
+            # ffprobe pass would double Range seeks for a bounded sample.
+            packet_sizes = (
+                probe_packet_stats(
+                    input_args,
+                    args.scan,
+                    partial_seconds,
+                    sample_start_seconds,
+                )
+                if args.scan == "full"
+                else {}
+            )
             apply_packet_bitrates(
                 media_info,
                 packet_sizes,
@@ -2762,13 +3342,21 @@ def collect_info_result(args, image: RemoteUdfImage, progress_file=None) -> dict
                     raise SystemExit(f"Error: {error}") from error
     return {
         "playlist": playlist,
-        "report": format_info_report(image, playlist, media_info, args.scan, partial_seconds),
+        "report": format_info_report(
+            image,
+            playlist,
+            media_info,
+            args.scan,
+            partial_seconds,
+            sample_start_seconds,
+        ),
         "emby_json": format_emby_json(
             image,
             playlist,
             media_info,
             args.scan,
             partial_seconds,
+            sample_start_seconds,
         ),
         "screenshots": screenshot_outputs,
         "screenshot_subtitle": screenshot_subtitle,
@@ -3165,10 +3753,16 @@ def add_remote_options(
     parser,
     suppress_defaults: bool = False,
     range_size_default: int | None = None,
+    workers_default: int | None = None,
+    prefetch_default: int | None = None,
 ) -> None:
     default_workers = argparse.SUPPRESS if suppress_defaults else DEFAULT_WORKERS
     default_prefetch = argparse.SUPPRESS if suppress_defaults else DEFAULT_PREFETCH
     default_range_size = argparse.SUPPRESS if suppress_defaults else DEFAULT_RANGE_SIZE
+    if workers_default is not None:
+        default_workers = workers_default
+    if prefetch_default is not None:
+        default_prefetch = prefetch_default
     if range_size_default is not None:
         default_range_size = range_size_default
     if isinstance(default_range_size, int):
@@ -3178,17 +3772,19 @@ def add_remote_options(
         )
     else:
         range_size_help = "HTTP Range chunk size, e.g. 4M, 8M, or 8388608"
+    workers_help = default_workers if isinstance(default_workers, int) else DEFAULT_WORKERS
+    prefetch_help = default_prefetch if isinstance(default_prefetch, int) else DEFAULT_PREFETCH
     parser.add_argument(
         "--workers",
         type=positive_int,
         default=default_workers,
-        help=f"parallel Range downloads (default: {DEFAULT_WORKERS})",
+        help=f"parallel Range downloads (default: {workers_help})",
     )
     parser.add_argument(
         "--prefetch",
         type=nonnegative_int,
         default=default_prefetch,
-        help=f"number of future Range chunks to prefetch (default: {DEFAULT_PREFETCH})",
+        help=f"number of future Range chunks to prefetch (default: {prefetch_help})",
     )
     parser.add_argument(
         "--range-size",
@@ -3219,6 +3815,8 @@ def build_parser():
         info_parser,
         suppress_defaults=True,
         range_size_default=INFO_DEFAULT_RANGE_SIZE,
+        workers_default=INFO_DEFAULT_WORKERS,
+        prefetch_default=INFO_DEFAULT_PREFETCH,
     )
     info_parser.add_argument("source", help=".strm 文件路径或 HTTP(S) ISO URL")
     info_parser.add_argument(
@@ -3236,7 +3834,7 @@ def build_parser():
     info_parser.add_argument(
         "--scan-duration",
         default=str(int(INFO_PARTIAL_SECONDS)),
-        help="partial scan duration in seconds or H:M:S (default: 100 seconds)",
+        help="partial scan duration in seconds or H:M:S (default: 10 seconds)",
     )
     info_parser.add_argument(
         "--format",
