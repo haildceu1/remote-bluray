@@ -105,7 +105,7 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.11.3 (ffprobe)", report)
+        self.assertIn("BDInfo:         remote-bluray 0.11.4 (ffprobe)", report)
         self.assertIn("Middle sample: 10 seconds at 0s", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)

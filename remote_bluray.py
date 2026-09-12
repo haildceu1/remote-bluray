@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.11.3"
+__version__ = "0.11.4"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
