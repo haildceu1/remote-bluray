@@ -298,6 +298,17 @@ class InfoTests(TestCase):
             "https://example.test/movie(1989).iso",
         )
 
+    def test_nested_release_directory_resolves_virtual_bdmv_paths(self):
+        image = app.RemoteUdfImage.__new__(app.RemoteUdfImage)
+        image.bdmv_root = "/My Release/BDMV"
+
+        self.assertEqual(image._resolve_bdmv_path("/BDMV"), "/My Release/BDMV")
+        self.assertEqual(
+            image._resolve_bdmv_path("/BDMV/PLAYLIST/00001.mpls"),
+            "/My Release/BDMV/PLAYLIST/00001.mpls",
+        )
+        self.assertEqual(image._resolve_bdmv_path("/"), "/")
+
     def test_playlist_candidates_skip_playlists_with_missing_m2ts(self):
         valid = app.Playlist(
             name="00800.mpls",

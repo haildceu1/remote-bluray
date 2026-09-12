@@ -8,6 +8,10 @@
 
 不会先下载完整 ISO；目录、播放列表和实际提取都按需读取远程 Range。当前测试原盘约 25.25 GiB。
 
+工具同时支持标准的 `/BDMV` 根目录和常见的发布文件夹嵌套布局，例如
+`/Release Name/BDMV`。检测到后一种布局时，命令行仍使用虚拟的
+`/BDMV/STREAM`、`/BDMV/PLAYLIST` 路径，不需要额外参数。
+
 ## 环境
 
 使用 Python 自带的 `venv`，不依赖 Conda：

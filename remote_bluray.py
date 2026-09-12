@@ -1198,6 +1198,10 @@ class RemoteUdfImage:
         self.partition_lengths: dict[int, int] = {}
         self.metadata_partition = None
         self.root_icb = None
+        # Standard Blu-ray images expose /BDMV at the UDF root.  Some
+        # release ISOs wrap the complete disc in one top-level directory;
+        # keep /BDMV as the public path and resolve it internally.
+        self.bdmv_root = "/BDMV"
         self._entry_cache: dict[tuple[int, int], dict] = {}
         self._directory_cache: dict[tuple[int, tuple], list[dict]] = {}
         self._playlist_cache: list[Playlist] | None = None
@@ -1284,10 +1288,12 @@ class RemoteUdfImage:
         if descriptor_tag(fsd) != 256:
             raise RuntimeError(f"UDF File Set Descriptor not found, got tag {descriptor_tag(fsd)}")
         self.root_icb = decode_long_ad(fsd, 400)
+        self.bdmv_root = self._discover_bdmv_root()
         if self.verbose:
             print(f"UDF volume: {self.volume_id}")
             print(f"UDF partitions: {self.partition_starts}")
             print(f"Root ICB: {self.root_icb}")
+            print(f"BDMV root: {self.bdmv_root}")
 
     def _read_descriptor(self, extent: dict) -> bytes:
         absolute = self.partition_base(extent["partition"]) + extent["lba"] * BLOCK_SIZE
@@ -1327,7 +1333,45 @@ class RemoteUdfImage:
                 return entry
         raise FileNotFoundError(name)
 
+    def _discover_bdmv_root(self) -> str:
+        """Find the physical BDMV directory, allowing one wrapper level."""
+        root_entry = self._entry_from_icb(self.root_icb)
+        if root_entry["file_type"] != 4:
+            raise RuntimeError("UDF root is not a directory")
+        root_entries = self._directory_from_entry(root_entry, self.root_icb["partition"])
+
+        def is_bdmv(entry: dict) -> bool:
+            return bool(entry.get("directory")) and entry.get("name", "").casefold() == "bdmv"
+
+        if any(is_bdmv(entry) for entry in root_entries):
+            return "/BDMV"
+
+        for wrapper in root_entries:
+            if not wrapper.get("directory"):
+                continue
+            wrapper_entry = self._entry_from_icb(wrapper["icb"])
+            if wrapper_entry["file_type"] != 4:
+                continue
+            wrapper_entries = self._directory_from_entry(
+                wrapper_entry, wrapper["icb"]["partition"]
+            )
+            if any(is_bdmv(entry) for entry in wrapper_entries):
+                return f"/{wrapper['name']}/BDMV"
+
+        raise FileNotFoundError("BDMV")
+
+    def _resolve_bdmv_path(self, path: str) -> str:
+        """Map a public /BDMV path to the detected physical path."""
+        normalized = path.replace("\\", "/")
+        folded = normalized.casefold()
+        if folded == "/bdmv":
+            return self.bdmv_root
+        if folded.startswith("/bdmv/"):
+            return self.bdmv_root + normalized[5:]
+        return normalized
+
     def find(self, path: str) -> UdfFile:
+        path = self._resolve_bdmv_path(path)
         components = [part for part in path.replace("\\", "/").split("/") if part]
         current_entry = {"directory": True, "icb": self.root_icb}
         current_partition = self.root_icb["partition"]
