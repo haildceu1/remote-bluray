@@ -33,14 +33,24 @@ python -m pip install .
 remote-bluray --version
 ```
 
-从 GitHub 安装（把地址替换成实际仓库地址）：
+从 GitHub 直接安装（无需先克隆仓库，推荐 HTTPS）：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install "git+ssh://git@github.com/haildceu1/remote-bluray.git"
+python -m pip install --upgrade "git+https://github.com/haildceu1/remote-bluray.git"
 remote-bluray --help
 ```
+
+如果目标电脑没有 Git，也可以直接安装 GitHub 的源码压缩包：
+
+```powershell
+python -m pip install --upgrade "https://github.com/haildceu1/remote-bluray/archive/refs/heads/main.zip"
+remote-bluray --version
+```
+
+升级已安装版本时，使用同一条 `--upgrade` 命令即可；它会从 `main` 分支获取最新提交，
+无需手动删除旧版本。GitHub 仓库公开时不需要 SSH 密钥或 GitHub 登录。
 
 构建可分发文件：
 

@@ -23,6 +23,11 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
 ]
 
+[project.urls]
+Homepage = "https://github.com/haildceu1/remote-bluray"
+Repository = "https://github.com/haildceu1/remote-bluray"
+Issues = "https://github.com/haildceu1/remote-bluray/issues"
+
 [project.scripts]
 remote-bluray = "remote_bluray:main"
 
