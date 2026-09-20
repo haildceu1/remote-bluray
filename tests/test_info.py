@@ -105,7 +105,7 @@ class InfoTests(TestCase):
         self.assertIn("DISC INFO:\n", report)
         self.assertIn("Protection:     AACS", report)
         self.assertIn("Extras:         BD-Java", report)
-        self.assertIn("BDInfo:         remote-bluray 0.11.4 (ffprobe)", report)
+        self.assertIn(f"BDInfo:         remote-bluray {app.__version__} (ffprobe)", report)
         self.assertIn("Middle sample: 10 seconds at 0s", report)
         self.assertIn("MPEG-4 AVC Video", report)
         self.assertIn("32682 kbps", report)
@@ -297,6 +297,21 @@ class InfoTests(TestCase):
             app.source_to_url(f"[movie]({escaped_url})"),
             "https://example.test/movie(1989).iso",
         )
+
+    def test_private_sources_bypass_environment_proxy_by_default(self):
+        self.assertTrue(app._default_no_proxy("http://10.40.161.250:9530/file.iso"))
+        self.assertTrue(app._default_no_proxy("http://127.0.0.1:9530/file.iso"))
+        self.assertFalse(app._default_no_proxy("https://example.com/file.iso"))
+
+    def test_remote_options_allow_explicit_proxy_override(self):
+        direct = app.build_parser().parse_args(
+            ["extract-video", "source.iso", "-o", "out.mkv", "--no-proxy"]
+        )
+        proxied = app.build_parser().parse_args(
+            ["extract-video", "source.iso", "-o", "out.mkv", "--use-proxy"]
+        )
+        self.assertTrue(direct.no_proxy)
+        self.assertFalse(proxied.no_proxy)
 
     def test_nested_release_directory_resolves_virtual_bdmv_paths(self):
         image = app.RemoteUdfImage.__new__(app.RemoteUdfImage)

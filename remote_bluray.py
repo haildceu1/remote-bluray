@@ -12,6 +12,7 @@ from collections import Counter, OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import os
 import random
@@ -41,7 +42,7 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.11.4"
+__version__ = "0.11.5"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
@@ -795,6 +796,24 @@ def source_to_url(source: str | Path) -> str:
     return url
 
 
+def _default_no_proxy(url: str) -> bool:
+    """Bypass inherited proxies for private/local source gateways.
+
+    Alist/115 gateways are commonly exposed on RFC1918 addresses.  Sending
+    those requests through a desktop proxy is both unnecessary and, for a
+    Range-heavy reader, often dramatically slower.  Public host names keep
+    the normal ``requests`` environment-proxy behavior unless the caller
+    explicitly passes ``--no-proxy``.
+    """
+    host = (urlsplit(url).hostname or "").strip().lower()
+    if host in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
+
+
 class RemoteRangeReader:
     def __init__(
         self,
@@ -803,6 +822,7 @@ class RemoteRangeReader:
         workers: int = DEFAULT_WORKERS,
         prefetch: int = DEFAULT_PREFETCH,
         range_size: int = DEFAULT_RANGE_SIZE,
+        no_proxy: bool | None = None,
     ):
         if workers < 1:
             raise ValueError("workers must be at least 1")
@@ -816,6 +836,12 @@ class RemoteRangeReader:
         self.workers = workers
         self.prefetch = prefetch
         self.range_size = range_size
+        # A private Alist/115 gateway is normally reached directly.  Requests
+        # otherwise inherits HTTP(S)_PROXY/ALL_PROXY, which can route the
+        # gateway and its CDN redirects through a local proxy and reduce a
+        # multi-megabyte Range transfer to a fraction of the available link.
+        # Keep an explicit override for users who really do need a proxy.
+        self.no_proxy = _default_no_proxy(url) if no_proxy is None else no_proxy
         self.lock = threading.RLock()
         self._thread_local = threading.local()
         self._cache: OrderedDict[int, bytes] = OrderedDict()
@@ -823,6 +849,7 @@ class RemoteRangeReader:
         self._executor = None
 
         session = requests.Session()
+        session.trust_env = not self.no_proxy
         try:
             last_error = None
             for attempt in range(MAX_RETRIES + 1):
@@ -891,13 +918,15 @@ class RemoteRangeReader:
             print(f"Final URL: {self.final_url[:120]}...")
             print(
                 f"Range reader: workers={self.workers}, "
-                f"prefetch={self.prefetch}, range-size={self.range_size:,} bytes"
+                f"prefetch={self.prefetch}, range-size={self.range_size:,} bytes, "
+                f"http-proxy={'disabled' if self.no_proxy else 'enabled'}"
             )
 
     def _session_for_thread(self) -> requests.Session:
         session = getattr(self._thread_local, "session", None)
         if session is None:
             session = requests.Session()
+            session.trust_env = not self.no_proxy
             session.cookies.update(self._base_cookies)
             self._thread_local.session = session
         return session
@@ -1183,6 +1212,7 @@ class RemoteUdfImage:
         workers: int = DEFAULT_WORKERS,
         prefetch: int = DEFAULT_PREFETCH,
         range_size: int = DEFAULT_RANGE_SIZE,
+        no_proxy: bool | None = None,
     ):
         self.source = str(source)
         self.url = source_to_url(source)
@@ -1193,6 +1223,7 @@ class RemoteUdfImage:
             workers=workers,
             prefetch=prefetch,
             range_size=range_size,
+            no_proxy=no_proxy,
         )
         self.partition_starts: dict[int, int] = {}
         self.partition_lengths: dict[int, int] = {}
@@ -3287,6 +3318,7 @@ def image_from_args(args) -> RemoteUdfImage:
         workers=args.workers,
         prefetch=args.prefetch,
         range_size=args.range_size,
+        no_proxy=args.no_proxy,
     )
 
 
@@ -3836,6 +3868,22 @@ def add_remote_options(
         default=default_range_size,
         metavar="SIZE",
         help=range_size_help,
+    )
+    proxy_default = argparse.SUPPRESS if suppress_defaults else None
+    proxy_group = parser.add_mutually_exclusive_group()
+    proxy_group.add_argument(
+        "--no-proxy",
+        dest="no_proxy",
+        action="store_true",
+        default=proxy_default,
+        help="bypass HTTP(S)_PROXY/ALL_PROXY (also automatic for private source IPs)",
+    )
+    proxy_group.add_argument(
+        "--use-proxy",
+        dest="no_proxy",
+        action="store_false",
+        default=proxy_default,
+        help="force inherited HTTP(S)_PROXY/ALL_PROXY, including for private sources",
     )
 
 

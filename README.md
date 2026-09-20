@@ -62,7 +62,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.11.4-py3-none-any.whl
+python -m pip install remote_bluray-0.11.5-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -97,15 +97,17 @@ python -X utf8 remote_bluray.py list $isoUrl
 
 远程 ISO 默认使用受控并发 Range 读取：`workers=2`、`prefetch=2`、`range-size=8M`。这会在保持请求量相对温和的同时，提前读取后续数据块。首次 Range 请求会自动重试，以应对 Emby/Alist 重定向到 CDN 时偶发的 TLS 握手超时。
 
+对于 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、回环地址等私有源地址，程序默认绕过 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。这是为了避免本地 Alist/115 网关及其重定向后的 CDN 被再次送入桌面代理；运行 `--verbose` 时会显示 `http-proxy=disabled`。公网域名仍按系统代理设置运行。需要强制使用代理时加 `--use-proxy`；需要明确直连时加 `--no-proxy`。
+
 可以根据远程服务器的限速情况调整：
 
 ```powershell
-python -X utf8 remote_bluray.py --workers 2 --prefetch 2 --range-size 8M list "D:\Cinema\strm\...\movie.strm"
+python -X utf8 remote_bluray.py --no-proxy --workers 2 --prefetch 2 --range-size 8M list "D:\Cinema\strm\...\movie.strm"
 
-python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls -o "D:\output\movie.mkv" --workers 4 --prefetch 4 --range-size 16M
+python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --playlist 00001.mpls -o "D:\output\movie.mkv" --no-proxy --workers 4 --prefetch 4 --range-size 16M
 ```
 
-建议先使用 `2/2/8M`；确认服务端没有返回 `429`、`403` 或频繁断开后，再尝试 `4/4/16M`。程序对 `429` 和 `5xx` 响应使用指数退避；并发过高仍可能触发远程服务的限速。
+建议先使用 `2/2/8M`；确认服务端没有返回 `429`、`403` 或频繁断开后，再尝试 `4/4/16M`。程序对 `429` 和 `5xx` 响应使用指数退避；并发过高仍可能触发远程服务的限速。若日志中的 `speed` 低于预期，先用 `--verbose` 确认代理状态，再用 `--no-proxy` 做一次 A/B 测试；`0.406x` 这类速度通常表示 ffmpeg 在等待远程 Range 数据，不是编码器速度。
 
 ## 查看播放列表
 
