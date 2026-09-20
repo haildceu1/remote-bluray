@@ -449,6 +449,26 @@ class InfoTests(TestCase):
 
         self.assertEqual(app.main_playlist([attached, bonus]).name, "00021.mpls")
 
+    def test_feature_mode_ignores_attached_loop_when_excluding_main(self):
+        feature = app.PlaylistItem("00304", "M2TS", 0, 3_767_000)
+        loop = app.PlaylistItem("00295", "M2TS", 0, 3_767_000)
+        source = (feature,) + (loop,) * 300
+        normalized, note = app.normalize_playlist_items(source)
+        attached = app.Playlist(
+            "00021.mpls", normalized, source_items=source, normalization_note=note
+        )
+        actual_feature = app.Playlist(
+            "00001.mpls", (app.PlaylistItem("00327", "M2TS", 0, 4_500_000),), size_bytes=20_000
+        )
+        near_duplicate = app.Playlist(
+            "00801.mpls", (app.PlaylistItem("00326", "M2TS", 0, 4_500_010),), size_bytes=10_000
+        )
+
+        self.assertEqual(
+            app.feature_reference_playlist([attached, actual_feature, near_duplicate]).name,
+            "00001.mpls",
+        )
+
     def test_physical_extent_beyond_eof_is_detected_without_reading_media(self):
         class Remote:
             size = 1_000

@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - exercised on minimal installations
     _CryptoMD4 = None
 
 
-__version__ = "0.11.5"
+__version__ = "0.11.6"
 BLOCK_SIZE = 2048
 ED2K_PART_SIZE = 9500 * 1024
 DEFAULT_RANGE_SIZE = 8 * 1024 * 1024
@@ -1757,6 +1757,35 @@ def main_playlist(playlists: list[Playlist]) -> Playlist:
     )
 
 
+def feature_reference_playlist(playlists: list[Playlist]) -> Playlist:
+    """Choose the playlist that ``feat`` mode must exclude.
+
+    Some authoring tools leave a playlist with one real feature followed by a
+    repeated tail (for example one clip repeated hundreds of times).  The
+    normalizer keeps that raw timeline available for compatibility, but its
+    inflated ``main_selection_duration`` must not cause ``feat`` mode to
+    treat the actual feature as an extra.  Prefer the longest ordinary,
+    non-looping playlist as the exclusion reference in that situation.
+    """
+    selected = main_playlist(playlists)
+    if not selected.has_attached_loop:
+        return selected
+    ordinary = [
+        playlist
+        for playlist in playlists
+        if not playlist.is_looping and not playlist.has_attached_loop
+    ]
+    if not ordinary:
+        return selected
+    return max(
+        ordinary,
+        # Authoring timestamps can differ by a few milliseconds between
+        # equivalent playlists.  Treat those as the same duration and use
+        # the larger stream size to choose the real feature.
+        key=lambda playlist: (round(playlist.duration_seconds, 1), playlist.size_bytes),
+    )
+
+
 def playlist_sample_point(playlist: Playlist, sample_seconds: float) -> tuple[PlaylistItem, float]:
     """Choose a clip and local timestamp around the playlist midpoint."""
     if not playlist.items:
@@ -1806,7 +1835,13 @@ def select_playlists(
         if min_duration is None:
             raise ValueError("feat mode requires --min-duration")
         threshold = parse_duration(min_duration)
-        main = main_playlist(playlists)
+        selected_main = main_playlist(playlists)
+        main = feature_reference_playlist(playlists)
+        if main.name.casefold() != selected_main.name.casefold():
+            print(
+                f"Feature mode: ignoring attached-loop playlist {selected_main.name} "
+                f"as the main reference; excluding {main.name} instead"
+            )
         selected = []
         for playlist in playlists:
             if playlist.name.casefold() == main.name.casefold():

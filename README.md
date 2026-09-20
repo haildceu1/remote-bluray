@@ -62,7 +62,7 @@ python -m build
 构建结果会放在 `dist/`，另一台设备可以安装其中的 `.whl` 文件：
 
 ```powershell
-python -m pip install remote_bluray-0.11.5-py3-none-any.whl
+python -m pip install remote_bluray-0.11.6-py3-none-any.whl
 ```
 
 依赖和工具：
@@ -108,6 +108,8 @@ python -X utf8 remote_bluray.py extract-video "D:\Cinema\strm\...\movie.strm" --
 ```
 
 建议先使用 `2/2/8M`；确认服务端没有返回 `429`、`403` 或频繁断开后，再尝试 `4/4/16M`。程序对 `429` 和 `5xx` 响应使用指数退避；并发过高仍可能触发远程服务的限速。若日志中的 `speed` 低于预期，先用 `--verbose` 确认代理状态，再用 `--no-proxy` 做一次 A/B 测试；`0.406x` 这类速度通常表示 ffmpeg 在等待远程 Range 数据，不是编码器速度。
+
+`--mode feat` 会排除主播放列表。对于少数带有“重复尾部”的异常 MPLS，程序会忽略被重复时长放大的列表，改用时长接近且文件更大的正常播放列表作为主片排除对象，避免把真正的主片误当成额外 feature。
 
 ## 查看播放列表
 
