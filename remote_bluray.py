@@ -1786,6 +1786,24 @@ def feature_reference_playlist(playlists: list[Playlist]) -> Playlist:
     )
 
 
+def same_playlist_timeline(left: Playlist, right: Playlist) -> bool:
+    """Return whether two MPLS files describe the same timeline.
+
+    Blu-ray authoring tools commonly emit multiple MPLS files for the same
+    title (for example ``00000.MPLS`` and ``00555.MPLS``).  Comparing only
+    the duration is not sufficient because two different bonus/features can
+    have the same runtime.  Include each clip's in/out timestamps so that an
+    alternate cut using the same M2TS file is not accidentally discarded.
+    """
+    return tuple(
+        (item.clip_id, item.in_time, item.out_time)
+        for item in left.items
+    ) == tuple(
+        (item.clip_id, item.in_time, item.out_time)
+        for item in right.items
+    )
+
+
 def playlist_sample_point(playlist: Playlist, sample_seconds: float) -> tuple[PlaylistItem, float]:
     """Choose a clip and local timestamp around the playlist midpoint."""
     if not playlist.items:
@@ -1844,7 +1862,12 @@ def select_playlists(
             )
         selected = []
         for playlist in playlists:
-            if playlist.name.casefold() == main.name.casefold():
+            if same_playlist_timeline(playlist, main):
+                if playlist.name.casefold() != main.name.casefold():
+                    print(
+                        f"Skip: {playlist.name} duplicates the main playlist "
+                        f"timeline ({main.name})"
+                    )
                 continue
             if playlist.is_looping:
                 print(

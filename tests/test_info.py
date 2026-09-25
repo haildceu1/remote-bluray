@@ -469,6 +469,33 @@ class InfoTests(TestCase):
             "00001.mpls",
         )
 
+    def test_feature_mode_excludes_duplicate_main_playlist_timeline(self):
+        main_item = app.PlaylistItem("00004", "M2TS", 0, 5_400_000)
+        duplicate_main = app.Playlist(
+            "00000.mpls", (main_item,), size_bytes=200_000
+        )
+        duplicate_alias = app.Playlist(
+            "00555.mpls", (main_item,), size_bytes=200_000
+        )
+        feature = app.Playlist(
+            "00002.mpls",
+            (app.PlaylistItem("00005", "M2TS", 0, 5_400_000),),
+            size_bytes=100_000,
+        )
+
+        selected = app.select_playlists(
+            SimpleNamespace(playlist_candidates=lambda: [
+                duplicate_main,
+                duplicate_alias,
+                feature,
+            ]),
+            None,
+            "feat",
+            "60",
+        )
+
+        self.assertEqual([playlist.name for playlist in selected], ["00002.mpls"])
+
     def test_physical_extent_beyond_eof_is_detected_without_reading_media(self):
         class Remote:
             size = 1_000
